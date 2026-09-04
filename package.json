@@ -1,0 +1,21 @@
+{
+  "name": "codex-environment-injector",
+  "version": "0.3.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:react": "node ./esbuild.config.mjs",
+    "check:react": "tsc --noEmit -p tsconfig.json",
+    "test:react": "node --test \"tests/react-*.test.mjs\""
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "esbuild": "^0.25.8",
+    "typescript": "^5.9.2"
+  }
+}

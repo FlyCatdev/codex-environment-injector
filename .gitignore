@@ -1,0 +1,17 @@
+node_modules/
+build/
+**/__pycache__/
+*.pyc
+*.pyo
+*.log
+*.zip
+*.tgz
+*.bak
+*.bak-*
+*.removed-*
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+tests/*.png

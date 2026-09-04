@@ -1,0 +1,35 @@
+{
+  "name": "codex-environment-injector",
+  "version": "0.3.2",
+  "description": "Inject and inspect per-conversation Codex environments with Profiles, prompts, Memories policy, AGENTS guidance, permissions, and redacted proof.",
+  "author": {
+    "name": "Local Codex Tools"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "environment",
+    "profile",
+    "memory",
+    "agents",
+    "desktop"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "环境注入器",
+    "shortDescription": "Manage and verify per-conversation Codex environments",
+    "longDescription": "Adds one pluggable Codex++ environment surface for Profile selection, direct-RPC prompt/config injection, injection proof, Memories policy and review, AGENTS drafts, migration, and rollback-safe installation.",
+    "developerName": "Local Codex Tools",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "brandColor": "#10A37F",
+    "defaultPrompt": [
+      "Use $environment-injector to inspect the current conversation environment and injection proof.",
+      "Use $environment-injector to create or edit an environment Profile, memory policy, or AGENTS guidance.",
+      "Use $environment-injector to diagnose migration, direct-RPC injection, installation, or rollback."
+    ]
+  }
+}

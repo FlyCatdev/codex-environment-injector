@@ -1,0 +1,20 @@
+{
+  "name": "codex-environment-tools",
+  "interface": {
+    "displayName": "Codex Environment Tools"
+  },
+  "plugins": [
+    {
+      "name": "codex-environment-injector",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-environment-injector"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
