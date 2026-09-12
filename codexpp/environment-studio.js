@@ -1,16 +1,17 @@
-/* Codex++ Environment Studio v0.3.2 */
+/* Codex++ Environment Studio v0.4.0 */
 (() => {
   "use strict";
 
   const GLOBAL_KEY = "__codexEnvironmentStudio";
   const LEGACY_GLOBAL_KEY = "__codexPlusProfileStudio";
   const INJECTOR_GLOBAL_KEY = "__codexEnvironmentInjector";
-  const VERSION = "0.3.2";
+  const VERSION = "0.4.0";
   const STORAGE_KEY = "codexpp.environmentInjector.v2";
   const LEGACY_STORAGE_KEY = "codexpp.profileStudio.v1";
   const STORE_VERSION = 2;
   const UPDATE_EVENT = "codexpp-environment-injector-updated";
   const NAV_ATTR = "data-codex-environment-injector-nav";
+  const STATUS_NAV_ATTR = "data-codex-environment-status-nav";
   const HOST_ID = "codexpp-environment-studio-host";
   const MAX_PROFILES = 50;
   const MAX_INSTRUCTIONS_CHARS = 40000;
@@ -27,8 +28,10 @@
   let shadow = null;
   let dialog = null;
   let navNode = null;
+  let statusNavNode = null;
   let observer = null;
   let scanTimer = 0;
+  let statusTimer = 0;
   let uiAdapter = null;
   let selectedKey = "";
   let selectedTargetProfileId = "";
@@ -77,15 +80,10 @@
   let store = loadStore();
 
   function saveStore() {
-    store.revision = Number(store.revision || 0) + 1;
-    store.updatedAt = new Date().toISOString();
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-    } catch (error) {
-      throw new Error(`保存环境失败：${error?.message || error}`);
-    }
-    window.dispatchEvent(new CustomEvent(UPDATE_EVENT));
-    window[INJECTOR_GLOBAL_KEY]?.refreshProfiles?.();
+    const injector = window[INJECTOR_GLOBAL_KEY];
+    if (!injector?.replaceEnvironmentStore) throw new Error("环境核心不可用");
+    injector.replaceEnvironmentStore(store);
+    store = loadStore();
     renderProfileList();
   }
 
@@ -365,19 +363,26 @@
     if (likelyContainsSecret(profile.developerInstructions)
         || likelyContainsSecret(profile.baseInstructions)
         || likelyContainsSecretValue(profile.config)) {
-      if (!window.confirm("环境内容可能包含密钥、Token 或认证字段。仍要保存到 Codex 页面 localStorage 吗？")) {
-        return;
-      }
+      setStatus("敏感字段不允许保存到环境，请改用环境变量名或凭据存储", "error");
+      return;
     }
     const nextKey = storageKeyFor(profile);
-    if (selectedKey && selectedKey !== nextKey) delete store.profiles[selectedKey];
-    store.profiles[nextKey] = profile;
+    try {
+      const injector = window[INJECTOR_GLOBAL_KEY];
+      if (!injector?.saveProfile) throw new Error("环境核心不可用");
+      injector.saveProfile(profile, { previousKey: selectedKey, expectedRevision: store.revision });
+      store = loadStore();
+    } catch {
+      setStatus("保存失败：环境冲突、数据不安全或存储不可写，请重新加载检查", "error");
+      return;
+    }
     selectedKey = nextKey;
     selectedTargetProfileId = String(profile.targetProfileId || "");
     sourceConfig = cloneJson(profile.config || {});
-    saveStore();
     if (ui.useNext.checked) {
-      window[INJECTOR_GLOBAL_KEY]?.setNext?.(selectorProfileId(profile));
+      try { window[INJECTOR_GLOBAL_KEY]?.setNext?.(selectorProfileId(profile)); } catch {
+        setStatus("环境已保存，但下次环境选择保存失败", "error"); return;
+      }
     }
     fillForm({ ...profile, storageKey: nextKey, sourceKind: profile.targetProfileId ? "override" : "studio" });
     if (profile.targetProfileId) {
@@ -396,7 +401,9 @@
       : `删除自定义 Profile“${profile.name || profile.id}”？`;
     if (!window.confirm(prompt)) return;
     delete store.profiles[selectedKey];
-    saveStore();
+    try { saveStore(); } catch {
+      store = loadStore(); setStatus("删除未保存，请重新加载检查", "error"); return;
+    }
     clearForm();
     setStatus(isOverride
       ? `已恢复文件 Profile：${profile.targetProfileId}`
@@ -476,6 +483,11 @@
       setStatus(error, "error");
       return;
     }
+    try {
+      const injector = window[INJECTOR_GLOBAL_KEY];
+      if (!injector?.validateProfileData) throw new Error("环境核心不可用");
+      injector.validateProfileData(profile);
+    } catch { setStatus("环境数据无效或包含敏感内容，已拒绝导出", "error"); return; }
     let content = "";
     try {
       content = profileToml(profile);
@@ -830,9 +842,106 @@
     }
   }
 
+  function environmentStatusLabel() {
+    let status = null;
+    try { status = window[INJECTOR_GLOBAL_KEY]?.status?.() || null; } catch {}
+    const profiles = Array.isArray(status?.profiles) ? status.profiles : [];
+    const currentThreadId = String(status?.currentThreadId || "").trim();
+    const profileId = currentThreadId
+      ? String(status?.currentProfileId || "base")
+      : String(status?.pendingProfileId || "base");
+    const profile = profiles.find((item) => String(item?.id || "") === profileId);
+    const name = String(profile?.name || (profileId === "base" ? "Base" : profileId));
+    const prefix = !currentThreadId && status?.pendingProfileId ? "下次环境" : "当前环境";
+    if (!currentThreadId || !status?.currentProfileBinding) return `${prefix}: ${name}`;
+    const binding = status.currentProfileBinding;
+    const proof = status.currentProof;
+    const confirmed = binding.applied === true && proof?.status === "acknowledged" && proof.matchesCurrentProfile === true
+      && binding.proofId && binding.proofId === proof.proofId
+      && /^sha256:[0-9a-f]{64}$/i.test(proof.payloadDigest || "");
+    return `${prefix}: ${name} · ${confirmed ? "转发已确认" : "未确认"}`;
+  }
+
+  function replaceStatusNavText(root, label) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    const target = nodes.find((node) => {
+      const text = String(node.nodeValue || "").trim();
+      return text === "环境注入器" || /^(当前环境|下次环境|环境)\s*[:：]/.test(text);
+    });
+    if (target) target.nodeValue = label;
+    else {
+      const text = document.createElement("span");
+      text.setAttribute("data-codex-environment-status-label", "true");
+      text.textContent = label;
+      root.append(text);
+    }
+  }
+
+  function updateSidebarStatus() {
+    if (!statusNavNode?.isConnected) {
+      statusNavNode = document.querySelector(`[${STATUS_NAV_ATTR}]`);
+    }
+    if (!statusNavNode) return;
+    const label = environmentStatusLabel();
+    if (statusNavNode.getAttribute("data-environment-status-label") !== label) {
+      replaceStatusNavText(statusNavNode, label);
+      statusNavNode.setAttribute("data-environment-status-label", label);
+      statusNavNode.setAttribute("aria-label", label);
+      statusNavNode.title = `${label}；点击选择下个对话环境`;
+    }
+  }
+
+  async function openEnvironmentSelector() {
+    const injector = window[INJECTOR_GLOBAL_KEY];
+    if (!injector || typeof injector.open !== "function") {
+      openStudio();
+      return;
+    }
+    try {
+      const selected = await injector.open();
+      if (selected && typeof injector.setNext === "function") injector.setNext(selected);
+    } catch {}
+  }
+
+  function installStatusEntry() {
+    if (!navNode?.isConnected) return;
+    const existing = document.querySelector(`[${STATUS_NAV_ATTR}]`);
+    if (existing) {
+      statusNavNode = existing;
+      if (navNode.nextElementSibling !== existing) navNode.insertAdjacentElement("afterend", existing);
+      updateSidebarStatus();
+      return;
+    }
+    const clone = navNode.cloneNode(true);
+    clone.removeAttribute(NAV_ATTR);
+    clone.setAttribute(STATUS_NAV_ATTR, "true");
+    clone.removeAttribute("id");
+    clone.removeAttribute("aria-current");
+    clone.removeAttribute("data-state");
+    clone.style.opacity = "0.78";
+    if (clone instanceof HTMLAnchorElement) clone.href = "#";
+    clone.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+    replaceStatusNavText(clone, environmentStatusLabel());
+    clone.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void openEnvironmentSelector();
+    }, { signal });
+    navNode.insertAdjacentElement("afterend", clone);
+    statusNavNode = clone;
+    updateSidebarStatus();
+  }
+
   function installSidebarEntry() {
     if (destroyed) return;
-    if (document.querySelector(`[${NAV_ATTR}]`)) return;
+    const existing = document.querySelector(`[${NAV_ATTR}]`);
+    if (existing) {
+      navNode = existing;
+      installStatusEntry();
+      return;
+    }
     const reference = findSidebarReference();
     if (!reference || !reference.parentElement) return;
     const clone = reference.cloneNode(true);
@@ -850,6 +959,7 @@
     }, { signal });
     reference.insertAdjacentElement("afterend", clone);
     navNode = clone;
+    installStatusEntry();
   }
 
   function scheduleSidebarScan() {
@@ -881,8 +991,10 @@
     lifetime.abort();
     observer?.disconnect();
     window.clearTimeout(scanTimer);
+    window.clearInterval(statusTimer);
     try { uiAdapter?.destroy?.(); } catch {}
     uiAdapter = null;
+    statusNavNode?.remove();
     navNode?.remove();
     host?.remove();
     const currentApi = window[GLOBAL_KEY];
@@ -905,6 +1017,7 @@
       selectorProfileId,
       storageKeyFor,
       environmentStore: () => cloneJson(store),
+      environmentStatusLabel,
     };
     window.__codexEnvironmentStudioTest = testApi;
     window.__codexPlusProfileStudioTest = testApi;
@@ -913,6 +1026,7 @@
 
   createUi();
   installSidebarEntry();
+  statusTimer = window.setInterval(updateSidebarStatus, 1000);
   observer = new MutationObserver(scheduleSidebarScan);
   observer.observe(document.documentElement, { childList: true, subtree: true });
   document.addEventListener("keydown", (event) => {
@@ -921,7 +1035,10 @@
   window.addEventListener(UPDATE_EVENT, () => {
     store = loadStore();
     renderProfileList();
+    updateSidebarStatus();
   }, { signal });
+  window.addEventListener("popstate", updateSidebarStatus, { signal });
+  window.addEventListener("hashchange", updateSidebarStatus, { signal });
 
   const publicApi = {
     version: VERSION,
@@ -940,6 +1057,8 @@
         storedProfiles: storedProfileEntries().length,
         storeRevision: Number(store.revision || 0),
         sidebarInstalled: !!document.querySelector(`[${NAV_ATTR}]`),
+        statusSidebarInstalled: !!document.querySelector(`[${STATUS_NAV_ATTR}]`),
+        environmentStatusLabel: environmentStatusLabel(),
         open: adapterStatus ? adapterStatus.open === true : !!dialog && !dialog.hidden,
         renderer: adapterStatus ? "react" : "vanilla",
       };

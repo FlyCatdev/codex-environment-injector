@@ -1,6 +1,6 @@
 {
   "name": "codex-environment-injector",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Inject and inspect per-conversation Codex environments with Profiles, prompts, Memories policy, AGENTS guidance, permissions, and redacted proof.",
   "author": {
     "name": "Local Codex Tools"

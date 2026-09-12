@@ -1,12 +1,16 @@
 {
   "name": "codex-environment-injector",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build:react": "node ./esbuild.config.mjs",
     "check:react": "tsc --noEmit -p tsconfig.json",
-    "test:react": "node --test \"tests/react-*.test.mjs\""
+    "test:react": "node --test \"tests/react-*.test.mjs\"",
+    "build:public": "npm run build:react && python tools/build_public.py",
+    "test:core": "node tests/test_environment_userscript.mjs",
+    "test:regression": "node --test tests/regression/test-*.cjs",
+    "test": "npm run test:react && npm run test:core && npm run test:regression && python -m unittest discover -s tests -p \"test_*.py\""
   },
   "dependencies": {
     "react": "^19.1.1",
@@ -17,5 +21,8 @@
     "@types/react-dom": "^19.1.7",
     "esbuild": "^0.25.8",
     "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

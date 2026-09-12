@@ -1,11 +1,11 @@
-/* Codex++ Environment Injector bundle v0.3.2 */
-/* Codex++ Environment Injector v0.3.2 */
+/* Codex++ Environment Injector bundle v0.4.0 */
+/* Codex++ Environment Injector v0.4.0 */
 (() => {
   "use strict";
 
   const GLOBAL_KEY = "__codexEnvironmentInjector";
   const LEGACY_GLOBAL_KEY = "__codexPlusProfileSelector";
-  const VERSION = "0.3.2";
+  const VERSION = "0.4.0";
   const STORAGE_KEY = "codexpp.environmentInjector.v2";
   const LEGACY_SELECTOR_STORAGE_KEY = "codexpp.profileSelector.v1";
   const LEGACY_STUDIO_STORAGE_KEY = "codexpp.profileStudio.v1";
@@ -15,7 +15,7 @@
   const HOST_ID = "codexpp-environment-injector-host";
   const UPDATE_EVENT = "codexpp-environment-injector-updated";
   const MAX_THREAD_ENTRIES = 160;
-  const ENVIRONMENT_BUNDLE = {"schemaVersion":2,"generatorVersion":"0.3.2","generatedAt":"2026-09-04T13:05:54+00:00","profiles":[],"warnings":[],"environment":{"capabilities":{"source":"generated-snapshot","diskRead":true,"diskWrite":false,"bridge":false},"globalAgents":{"exists":false,"name":"AGENTS.md","content":"","hash":null},"memory":{"settings":{"enabled":false},"summary":{"exists":false,"name":"memory_summary.md","content":"","hash":null},"durable":{"exists":false,"name":"MEMORY.md","content":"","hash":null},"files":[]}}};
+  const ENVIRONMENT_BUNDLE = {"schemaVersion":2,"generatorVersion":"0.4.0","generatedAt":"","profiles":[],"warnings":[],"environment":{"capabilities":{"source":"public-bundle","diskRead":false,"diskWrite":false,"bridge":false}}};
 
   window[GLOBAL_KEY]?.destroy?.();
   if (window[LEGACY_GLOBAL_KEY] && window[LEGACY_GLOBAL_KEY] !== window[GLOBAL_KEY]) {
@@ -27,6 +27,13 @@
   const wrapperToken = {};
   const patchedClients = new Set();
   const environmentControllers = new Set();
+  const resumeRequests = new Map();
+  const profileDigests = new Map();
+  const eligiblePrewarms = new Map();
+  const profileSwitches = new Map();
+  const profileSwitchResults = new Map();
+  const profileSwitchSelections = new Map();
+  let selectionEpoch = 0;
   const replayTargets = new WeakSet();
   const modulePromises = new Map();
   const staticProfiles = Array.isArray(ENVIRONMENT_BUNDLE.profiles)
@@ -57,6 +64,10 @@
   let tutorialTab = null;
   let memoryRoot = null;
   let agentsRoot = null;
+  let memoryRenderEpoch = 0;
+  let agentsRenderEpoch = 0;
+  let activeMemoryEditor = null;
+  let activeAgentsEditor = null;
   let tutorialRoot = null;
   let panelFooter = null;
   let panelMode = "select";
@@ -84,6 +95,84 @@
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
 
+  function containsSensitiveData(value, depth = 0) {
+    if (depth > 32) throw new Error("配置嵌套过深");
+    if (typeof value === "string") {
+      let parsed;
+      try { parsed = JSON.parse(value); } catch {}
+      if (parsed && typeof parsed === "object") return containsSensitiveData(parsed, depth + 1);
+      return /\bsk-[A-Za-z0-9_-]{16,}\b|\bBearer\s+[A-Za-z0-9_./+=-]{12,}|[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@|\b(?:api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization|credential)["']\s*:|\b(?:api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization|credential)["']?\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{12,}/i.test(value);
+    }
+    if (Array.isArray(value)) return value.some(item => containsSensitiveData(item, depth + 1));
+    if (!isObject(value)) return false;
+    return Object.entries(value).some(([key, item]) => {
+      const name = key.replace(/[-_\s]/g, "").toLowerCase();
+      return /(?:apikey|password|passwd|clientsecret|accesstoken|refreshtoken|authtoken|authorization|credentials?|authcontents)$/.test(name)
+        || ["token", "secret", "bearer"].includes(name)
+        || containsSensitiveData(item, depth + 1);
+    });
+  }
+
+  function assertSafeProfile(profile) {
+    if (!isObject(profile) || !/^[A-Za-z0-9_-]{1,100}$/.test(profile.id || "")
+        || ["__proto__", "constructor", "prototype"].includes(profile.id)) throw new Error("环境 ID 无效");
+    if (Object.hasOwn(profile, "config") && !isObject(profile.config)) throw new Error("Additional Config 必须是 JSON 对象");
+    for (const name of ["developerInstructions", "baseInstructions"]) {
+      if (profile[name] != null && (typeof profile[name] !== "string" || profile[name].length > 40000))
+        throw new Error("提示词必须为不超过 40000 字符的文本");
+    }
+    if (containsSensitiveData(profile)) throw new Error("环境包含敏感字段，已拒绝保存；请改用环境变量名或凭据存储");
+    const checkKeys = value => {
+      if (!value || typeof value !== "object") return;
+      for (const [key, item] of Object.entries(value)) {
+        if (["__proto__", "constructor", "prototype"].includes(key)) throw new Error("配置包含不安全字段");
+        checkKeys(item);
+      }
+    };
+    checkKeys(profile.config);
+    return true;
+  }
+
+  function assertSafeDraft(text) {
+    if (typeof text !== "string" || new TextEncoder().encode(text).length > 256 * 1024)
+      throw new Error("草案必须是不超过 256 KiB 的文本");
+    if (containsSensitiveData(text)) throw new Error("草案包含敏感内容，已拒绝保存");
+    return true;
+  }
+
+  function installEnvironmentStore(nextStore) {
+    let next;
+    try { next = JSON.parse(JSON.stringify(nextStore)); } catch { throw new Error("环境数据无法序列化"); }
+    if (!isObject(next) || next.schemaVersion !== STATE_VERSION || !isObject(next.profiles))
+      throw new Error("环境存储结构无效");
+    if (Number(next.revision) !== Number(environmentStore.revision)) throw new Error("环境已变化，请重新加载后保存");
+    if (Object.keys(next.profiles).length > 50) throw new Error("最多保存 50 个本地环境");
+    for (const profile of Object.values(next.profiles)) assertSafeProfile(profile);
+    for (const key of ["agentsDraft", "memoryCorrectionDraft"]) {
+      if (Object.hasOwn(next.ui || {}, key)) assertSafeDraft(next.ui[key]);
+    }
+    environmentStore = normalizeEnvironmentStore(next);
+    saveEnvironmentStore();
+    refreshProfileCatalog();
+    state = loadState();
+    renderProfileOptions();
+    updatePill();
+    return uiSnapshot();
+  }
+
+  function saveEnvironmentProfile(profile, options = {}) {
+    assertSafeProfile(profile);
+    if (options.expectedRevision != null && Number(options.expectedRevision) !== Number(environmentStore.revision))
+      throw new Error("环境已变化，请重新加载后保存");
+    const key = profile.targetProfileId ? `override:${profile.targetProfileId}` : profile.id;
+    const previousKey = String(options.previousKey || "");
+    if (Object.hasOwn(environmentStore.profiles, key) && key !== previousKey) throw new Error("环境 ID 已存在，不能覆盖另一环境");
+    const next = cloneJson(environmentStore);
+    if (previousKey && previousKey !== key) delete next.profiles[previousKey];
+    next.profiles[key] = cloneJson(profile);
+    return installEnvironmentStore(next);
+  }
+
   async function bridgeCall(path, payload = {}) {
     if (typeof window.__codexSessionDeleteBridge !== "function") {
       return { status: "unavailable", message: "Codex++ bridge unavailable" };
@@ -95,8 +184,9 @@
     }
   }
 
-  async function refreshBridgeState() {
+  async function refreshBridgeState({ renderEditors = true } = {}) {
     const capabilities = await bridgeCall("/environment-injector/capabilities", {});
+    if (destroyed) return;
     if (capabilities?.status !== "ok") {
       bridgeCapabilities = null;
       bridgeAgents = null;
@@ -108,10 +198,13 @@
       bridgeCall("/environment-injector/agents/get", {}),
       bridgeCall("/environment-injector/memory/get", {}),
     ]);
+    if (destroyed) return;
     bridgeAgents = agents?.status === "ok" ? agents : null;
     bridgeMemory = memory?.status === "ok" ? memory : null;
-    if (panelMode === "memory") renderMemoryView();
-    if (panelMode === "agents") renderAgentsView();
+    activeMemoryEditor?.refreshSource?.();
+    activeAgentsEditor?.refreshSource?.();
+    if (renderEditors && panelMode === "memory" && !activeMemoryEditor?.dirty) renderMemoryView();
+    if (renderEditors && panelMode === "agents" && !activeAgentsEditor?.dirty) renderAgentsView();
     updatePill();
   }
 
@@ -189,11 +282,18 @@
   function saveEnvironmentStore() {
     environmentStore.revision = Number(environmentStore.revision || 0) + 1;
     environmentStore.updatedAt = new Date().toISOString();
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(environmentStore)); } catch {}
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(environmentStore)); } catch {
+      environmentStore = cloneJson(lastCommittedStore);
+      refreshProfileCatalog();
+      state = loadState();
+      throw new Error("环境保存失败：本地存储不可写或配额不足；修改未保存");
+    }
+    lastCommittedStore = cloneJson(environmentStore);
     if (typeof CustomEvent === "function") window.dispatchEvent(new CustomEvent(UPDATE_EVENT));
   }
 
   let environmentStore = loadEnvironmentStore();
+  let lastCommittedStore = cloneJson(environmentStore);
   dialogExpanded = environmentStore.ui?.panelExpanded === true;
 
   function studioProfiles() {
@@ -243,6 +343,28 @@
     }
     profiles = catalog;
     profileMap = new Map(profiles.map((profile) => [profile.id, profile]));
+    let invalidate = false;
+    for (const profile of profiles) {
+      const signature = profileSignature(profile);
+      const previous = profileDigests.get(profile.id);
+      if (previous?.signature === signature) continue;
+      if (previous) invalidate = true;
+      const entry = { signature, digest: null };
+      profileDigests.set(profile.id, entry);
+      void profilePayloadDigest(profile).then(digest => {
+        if (destroyed || profileDigests.get(profile.id) !== entry) return;
+        entry.digest = digest;
+        updatePill();
+      });
+    }
+    for (const id of profileDigests.keys()) {
+      if (!profileMap.has(id)) { profileDigests.delete(id); invalidate = true; }
+    }
+    if (invalidate) {
+      selectionEpoch += 1;
+      eligiblePrewarms.clear();
+      discardPrewarmedThreads();
+    }
   }
 
   refreshProfileCatalog();
@@ -350,6 +472,17 @@
     saveState();
   }
 
+  function persistObservedBinding(threadId, profileId, metadata) {
+    try { bindThreadProfile(threadId, profileId, metadata); return true; } catch {
+      // Storage bookkeeping must never make an accepted RPC look rejected.
+      const id = normalizedThreadId(threadId);
+      state.threadProfiles[id] = { profileId, applied: false, source: "proof-storage-error", at: Date.now() };
+      state.proofByThread[id] = { profileId, status: "observed-unconfirmed", proofId: null, payloadDigest: null };
+      traceRequest("proof-storage-error", { threadId: id, profileId });
+      return false;
+    }
+  }
+
   function discardPrewarmedThreads() {
     for (const controller of environmentControllers) {
       const manager = ownValue(controller, "prewarmedThreadManager");
@@ -366,7 +499,9 @@
 
   function setPendingProfile(profileId) {
     const nextProfileId = validProfileId(profileId);
-    if (state.pendingProfileId !== nextProfileId) discardPrewarmedThreads();
+    selectionEpoch += 1;
+    eligiblePrewarms.clear();
+    discardPrewarmedThreads();
     state.pendingProfileId = nextProfileId;
     saveState();
   }
@@ -375,6 +510,12 @@
     if (state.pendingProfileId === profileId) {
       state.pendingProfileId = "";
       saveState();
+    }
+  }
+
+  function consumeObservedSelection(profileId) {
+    try { consumePendingProfile(profileId); } catch {
+      traceRequest("selection-storage-error", { profileId });
     }
   }
 
@@ -423,9 +564,19 @@
     return () => {
       if (uiAdapter !== adapter) return;
       uiAdapter = null;
-      if (pill) pill.hidden = false;
+      if (pill) pill.hidden = true;
       updatePill();
     };
+  }
+
+  function currentViewIdentity() {
+    const id = currentThreadId();
+    const binding = threadProfileEntry(id);
+    const proof = state.proofByThread[id];
+    const switching = currentSwitchStatus(id);
+    return [id, binding?.profileId || "base", String(binding?.applied), proof?.status || "",
+      String(proofMatchesProfile(proof, binding?.profileId)), state.pendingProfileId,
+      switching.phase || "", switching.result?.status || "", String(switching.available)].join("|");
   }
 
   function updatePill() {
@@ -436,7 +587,7 @@
     if (panelMode === "current" && panel && !panel.hidden) {
       const threadId = currentThreadId();
       const entry = threadProfileEntry(threadId);
-      const identity = [threadId, entry?.profileId || "base", String(entry?.applied), state.pendingProfileId].join("|");
+      const identity = currentViewIdentity();
       if (identity !== currentRenderIdentity) renderCurrentProfileView();
     }
     notifyUiAdapter();
@@ -572,8 +723,15 @@
     if (!entry) {
       return { kind: "base", label: "未由选择器管理", detail: "该会话没有 Profile 绑定记录，按 Base / Codex 全局配置运行。" };
     }
+    const proof = state.proofByThread?.[threadId];
+    if (entry.applied === true && proof?.status === "acknowledged"
+        && entry.proofId && entry.proofId === proof.proofId
+        && /^sha256:[0-9a-f]{64}$/i.test(proof.payloadDigest || "")
+        && proofMatchesProfile(proof, entry.profileId)) {
+      return { kind: "confirmed", label: "请求转发已确认", detail: "环境参数已转发并关联到该会话；最终模型行为仍需独立测试。" };
+    }
     if (entry.applied === true) {
-      return { kind: "confirmed", label: "已确认注入", detail: "选择器通过兼容的 thread 生命周期通道完成并记录了注入。" };
+      return { kind: "unconfirmed", label: "当前版本未确认", detail: "证明缺失、正在校验或对应旧版环境；编辑后的内容尚未确认转发。" };
     }
     if (entry.applied === false) {
       return { kind: "unconfirmed", label: "已选择 · 未确认注入", detail: "当前是 direct-RPC 通道；下方显示计划注入内容，不代表 Codex 最终已采用。" };
@@ -592,7 +750,7 @@
       ? state.proofByThread[threadId]
       : null;
     const status = currentBindingStatus(entry, threadId);
-    currentRenderIdentity = [threadId, profileId, String(entry?.applied), proof?.status || "", state.pendingProfileId].join("|");
+    currentRenderIdentity = currentViewIdentity();
 
     const hero = document.createElement("section");
     hero.className = "current-hero";
@@ -620,6 +778,41 @@
       hero.append(id);
     }
     currentRoot.append(hero);
+    if (threadId) {
+      const switchCard = document.createElement("section");
+      switchCard.className = "environment-editor-card";
+      const heading = document.createElement("strong");
+      heading.textContent = "切换当前对话的 Profile";
+      const choices = document.createElement("select");
+      for (const item of profiles) {
+        const option = document.createElement("option");
+        option.value = item.id; option.textContent = item.name;
+        choices.append(option);
+      }
+      choices.value = profileSwitchSelections.get(threadId) || profileId;
+      choices.addEventListener("change", () => {
+        profileSwitchSelections.set(threadId, choices.value);
+        while (profileSwitchSelections.size > MAX_THREAD_ENTRIES)
+          profileSwitchSelections.delete(profileSwitchSelections.keys().next().value);
+      }, { signal });
+      const feedback = document.createElement("p");
+      const availability = currentSwitchStatus(threadId);
+      feedback.textContent = availability.busy ? "正在更新原生会话设置…" : availability.result?.message || availability.reason;
+      const apply = createEnvironmentButton("应用到当前对话", async () => {
+        const selected = profileById(choices.value);
+        if (!window.confirm(`将本会话的热切项应用为“${selected.name}”？更新 Developer、模型、推理和 Service Tier；历史及后台服务保留，初始化配置不热切。${selected.modelProvider ? `Profile 指定 Provider：${selected.modelProvider}；仅允许与当前相同。` : ""}`)) return;
+        apply.disabled = true;
+        try { await switchThreadProfile(threadId, selected.id); } catch (error) {
+          feedback.textContent = error?.message || "切换未确认，请检查会话设置";
+        }
+        if (!destroyed && currentThreadId() === threadId) renderCurrentProfileView();
+      }, true);
+      apply.disabled = !availability.available || availability.busy;
+      const note = document.createElement("p");
+      note.textContent = "仅支持 Default 模式的空闲会话。Base 撤销本功能的附加角色规则；Provider、Base Instructions、插件、记忆初始化配置需新会话。";
+      switchCard.append(heading, choices, apply, feedback, note);
+      currentRoot.append(switchCard);
+    }
 
     if (state.pendingProfileId) {
       const pending = document.createElement("section");
@@ -729,9 +922,11 @@
 
   function renderMemoryView() {
     if (!memoryRoot) return;
+    const renderEpoch = ++memoryRenderEpoch;
+    const retainedDraft = activeMemoryEditor?.dirty ? activeMemoryEditor.textarea.value : null;
     memoryRoot.replaceChildren();
     const snapshotMemory = ENVIRONMENT_BUNDLE.environment?.memory || {};
-    const memory = bridgeMemory ? { ...snapshotMemory, ...bridgeMemory, settings: snapshotMemory.settings || {} } : snapshotMemory;
+    let memory = bridgeMemory ? { ...snapshotMemory, ...bridgeMemory, settings: snapshotMemory.settings || {} } : snapshotMemory;
     const settings = isObject(memory.settings) ? memory.settings : {};
     const bridgeWritable = bridgeCapabilities?.diskWrite === true;
     memoryRoot.append(createEnvironmentHeading(
@@ -740,7 +935,7 @@
     ));
     const meta = document.createElement("section");
     meta.className = "current-meta";
-    appendMetaRow(meta, "总开关", settings.enabled === true ? "已开启" : "已关闭");
+    appendMetaRow(meta, "总开关", settings.enabled === true ? "已开启" : settings.enabled === false ? "已关闭" : "未知 / 未读取");
     appendMetaRow(meta, "读取记忆", settings.use_memories === false ? "关闭" : settings.use_memories === true ? "开启" : "继承");
     appendMetaRow(meta, "生成记忆", settings.generate_memories === false ? "关闭" : settings.generate_memories === true ? "开启" : "继承");
     appendMetaRow(meta, "外部上下文排除", settings.disable_on_external_context === true ? "开启" : "关闭 / 未设置");
@@ -759,19 +954,33 @@
     const textarea = document.createElement("textarea");
     textarea.className = "environment-editor";
     textarea.placeholder = "例如：\n- 稳定偏好：默认使用简体中文。\n- 纠正：领域记忆只在 cwd/任务匹配时使用。\n- 不要把某个 Profile 的角色推广为全局记忆。";
-    textarea.value = String(environmentStore.ui?.memoryCorrectionDraft ?? memory.correction?.content ?? "");
+    textarea.value = String(retainedDraft ?? environmentStore.ui?.memoryCorrectionDraft ?? memory.correction?.content ?? "");
+    const editorState = { textarea, dirty: retainedDraft !== null, refreshSource: () => {
+      if (bridgeMemory) memory = { ...memory, ...bridgeMemory };
+    } };
+    activeMemoryEditor = editorState;
     const actions = document.createElement("div");
     actions.className = "environment-actions";
     const previewStatus = document.createElement("p");
     previewStatus.className = "environment-preview-status";
     let preview = null;
+    let previewGeneration = 0;
+    let committing = false;
+    const comparison = document.createElement("pre");
+    comparison.className = "current-pre";
     const commitButton = createEnvironmentButton("确认写入修正 Note", async () => {
-      if (!preview) return;
+      if (destroyed || committing || !preview || preview.content !== textarea.value
+          || preview.generation !== previewGeneration) return;
+      committing = true;
+      const submitted = preview.content;
+      const persistedDraftBefore = environmentStore.ui.memoryCorrectionDraft;
       const expectedHash = preview.before?.hash;
       const result = await bridgeCall("/environment-injector/memory/commit-correction", {
-        content: textarea.value,
+        content: submitted,
         ...(typeof expectedHash === "string" ? { expectedHash } : {}),
       });
+      committing = false;
+      if (destroyed || renderEpoch !== memoryRenderEpoch) return;
       if (result?.status === "conflict") {
         previewStatus.textContent = "源文件已变化，请重新预览。";
         previewStatus.dataset.kind = "error";
@@ -784,27 +993,52 @@
         previewStatus.dataset.kind = "error";
         return;
       }
+      if (textarea.value !== submitted || environmentStore.ui.memoryCorrectionDraft !== persistedDraftBefore) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "先前草案已写入，提交期间的新编辑已保留";
+        return;
+      }
       delete environmentStore.ui.memoryCorrectionDraft;
-      saveEnvironmentStore();
+      try { saveEnvironmentStore(); } catch {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入，但本地草案清理失败"; return;
+      }
       showToast(`Memory 修正 Note 已写入；备份：${result.backup || "新文件"}`);
-      await refreshBridgeState();
+      editorState.dirty = false;
+      await refreshBridgeState({ renderEditors: false });
+      if (destroyed || renderEpoch !== memoryRenderEpoch) return;
+      if (editorState.dirty || textarea.value !== submitted || environmentStore.ui.memoryCorrectionDraft !== undefined) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入；刷新期间的新编辑已保留，请重新预览"; return;
+      }
       renderMemoryView();
     }, true);
     commitButton.disabled = true;
+    textarea.addEventListener("input", () => {
+      editorState.dirty = true;
+      previewGeneration += 1; preview = null; commitButton.disabled = true; comparison.textContent = "";
+    }, { signal });
     actions.append(
       createEnvironmentButton("保存草案", () => {
+        try { assertSafeDraft(textarea.value); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         environmentStore.ui.memoryCorrectionDraft = textarea.value;
         saveEnvironmentStore();
         showToast("记忆修正草案已保存（尚未写入 Memory）");
       }),
       createEnvironmentButton("复制草案", () => { void copyEnvironmentText(textarea.value, "记忆草案已复制"); }),
       createEnvironmentButton("预览写入", async () => {
+        const generation = ++previewGeneration;
+        const content = textarea.value;
+        preview = null; commitButton.disabled = true;
+        try { assertSafeDraft(content); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         const expectedHash = memory.correction?.hash;
         const result = await bridgeCall("/environment-injector/memory/preview-correction", {
-          content: textarea.value,
+          content,
           ...(typeof expectedHash === "string" ? { expectedHash } : {}),
         });
-        preview = result?.status === "ok" ? result : null;
+        if (destroyed || renderEpoch !== memoryRenderEpoch || generation !== previewGeneration || content !== textarea.value) return;
+        preview = result?.status === "ok" ? { ...result, content, generation } : null;
+        comparison.textContent = preview ? `--- 当前磁盘内容\n${memory.correction?.content || ""}\n+++ 确认后写入内容\n${content}` : "";
         commitButton.disabled = !preview;
         previewStatus.dataset.kind = result?.status === "ok" ? "success" : "error";
         previewStatus.textContent = result?.status === "ok"
@@ -817,7 +1051,7 @@
     if (!bridgeWritable) {
       for (const button of [actions.children[2], commitButton]) button.disabled = true;
     }
-    editor.append(label, help, textarea, actions, previewStatus);
+    editor.append(label, help, textarea, actions, previewStatus, comparison);
     memoryRoot.append(editor);
     const note = document.createElement("p");
     note.className = "current-note";
@@ -829,8 +1063,10 @@
 
   function renderAgentsView() {
     if (!agentsRoot) return;
+    const renderEpoch = ++agentsRenderEpoch;
+    const retainedDraft = activeAgentsEditor?.dirty ? activeAgentsEditor.textarea.value : null;
     agentsRoot.replaceChildren();
-    const agents = bridgeAgents || ENVIRONMENT_BUNDLE.environment?.globalAgents || {};
+    let agents = bridgeAgents || ENVIRONMENT_BUNDLE.environment?.globalAgents || {};
     const bridgeWritable = bridgeCapabilities?.diskWrite === true;
     agentsRoot.append(createEnvironmentHeading(
       "全局 AGENTS.md",
@@ -853,19 +1089,33 @@
     help.textContent = "显式任务和选中环境应优先于泛化记忆；Memories 只作为背景事实。";
     const textarea = document.createElement("textarea");
     textarea.className = "environment-editor tall";
-    textarea.value = String(environmentStore.ui?.agentsDraft ?? agents.content ?? "");
+    textarea.value = String(retainedDraft ?? environmentStore.ui?.agentsDraft ?? agents.content ?? "");
+    const editorState = { textarea, dirty: retainedDraft !== null, refreshSource: () => {
+      if (bridgeAgents) agents = bridgeAgents;
+    } };
+    activeAgentsEditor = editorState;
     const actions = document.createElement("div");
     actions.className = "environment-actions";
     const previewStatus = document.createElement("p");
     previewStatus.className = "environment-preview-status";
     let preview = null;
+    let previewGeneration = 0;
+    let committing = false;
+    const comparison = document.createElement("pre");
+    comparison.className = "current-pre";
     const commitButton = createEnvironmentButton("确认写入 AGENTS.md", async () => {
-      if (!preview) return;
+      if (destroyed || committing || !preview || preview.content !== textarea.value
+          || preview.generation !== previewGeneration) return;
+      committing = true;
+      const submitted = preview.content;
+      const persistedDraftBefore = environmentStore.ui.agentsDraft;
       const expectedHash = preview.before?.hash;
       const result = await bridgeCall("/environment-injector/agents/commit", {
-        content: textarea.value,
+        content: submitted,
         ...(typeof expectedHash === "string" ? { expectedHash } : {}),
       });
+      committing = false;
+      if (destroyed || renderEpoch !== agentsRenderEpoch) return;
       if (result?.status === "conflict") {
         previewStatus.textContent = "AGENTS.md 已被外部修改，请重新预览。";
         previewStatus.dataset.kind = "error";
@@ -878,15 +1128,34 @@
         previewStatus.dataset.kind = "error";
         return;
       }
+      if (textarea.value !== submitted || environmentStore.ui.agentsDraft !== persistedDraftBefore) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "先前草案已写入，提交期间的新编辑已保留";
+        return;
+      }
       delete environmentStore.ui.agentsDraft;
-      saveEnvironmentStore();
+      try { saveEnvironmentStore(); } catch {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入，但本地草案清理失败"; return;
+      }
       showToast(`AGENTS.md 已写入；备份：${result.backup || "新文件"}`);
-      await refreshBridgeState();
+      editorState.dirty = false;
+      await refreshBridgeState({ renderEditors: false });
+      if (destroyed || renderEpoch !== agentsRenderEpoch) return;
+      if (editorState.dirty || textarea.value !== submitted || environmentStore.ui.agentsDraft !== undefined) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入；刷新期间的新编辑已保留，请重新预览"; return;
+      }
       renderAgentsView();
     }, true);
     commitButton.disabled = true;
+    textarea.addEventListener("input", () => {
+      editorState.dirty = true;
+      previewGeneration += 1; preview = null; commitButton.disabled = true; comparison.textContent = "";
+    }, { signal });
     actions.append(
       createEnvironmentButton("保存草案", () => {
+        try { assertSafeDraft(textarea.value); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         environmentStore.ui.agentsDraft = textarea.value;
         saveEnvironmentStore();
         showToast("AGENTS.md 草案已保存（尚未写入磁盘）");
@@ -894,12 +1163,18 @@
       createEnvironmentButton("复制", () => { void copyEnvironmentText(textarea.value, "AGENTS.md 草案已复制"); }),
       createEnvironmentButton("导出 AGENTS.md", () => downloadEnvironmentText("AGENTS.md", textarea.value, "text/markdown")),
       createEnvironmentButton("预览写入", async () => {
+        const generation = ++previewGeneration;
+        const content = textarea.value;
+        preview = null; commitButton.disabled = true;
+        try { assertSafeDraft(content); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         const expectedHash = agents.hash;
         const result = await bridgeCall("/environment-injector/agents/preview", {
-          content: textarea.value,
+          content,
           ...(typeof expectedHash === "string" ? { expectedHash } : {}),
         });
-        preview = result?.status === "ok" ? result : null;
+        if (destroyed || renderEpoch !== agentsRenderEpoch || generation !== previewGeneration || content !== textarea.value) return;
+        preview = result?.status === "ok" ? { ...result, content, generation } : null;
+        comparison.textContent = preview ? `--- 当前磁盘内容\n${agents.content || ""}\n+++ 确认后写入内容\n${content}` : "";
         commitButton.disabled = !preview;
         previewStatus.dataset.kind = result?.status === "ok" ? "success" : "error";
         previewStatus.textContent = result?.status === "ok"
@@ -908,13 +1183,15 @@
       }),
       commitButton,
       createEnvironmentButton("恢复当前文件", () => {
+        editorState.dirty = false;
         textarea.value = String(agents.content || "");
+        previewGeneration += 1; preview = null; commitButton.disabled = true; comparison.textContent = "";
       }),
     );
     if (!bridgeWritable) {
       for (const button of [actions.children[3], commitButton]) button.disabled = true;
     }
-    editor.append(label, help, textarea, actions, previewStatus);
+    editor.append(label, help, textarea, actions, previewStatus, comparison);
     agentsRoot.append(editor);
     const note = document.createElement("p");
     note.className = "current-note";
@@ -1357,7 +1634,7 @@
     toastNode.className = "toast";
     toastNode.hidden = true;
 
-    shadow.append(style, panel, toastNode, pill);
+    shadow.append(style, panel, toastNode);
     document.documentElement.append(host);
     updatePill();
   }
@@ -1387,12 +1664,13 @@
     event.stopImmediatePropagation();
     const selected = await chooseProfile("为新对话选择环境");
     if (!selected || destroyed) return;
+    setPendingProfile(selected);
     pendingThreadObservation = {
       profileId: validProfileId(selected),
       previousThreadId: currentThreadId(),
       at: Date.now(),
+      epoch: selectionEpoch,
     };
-    setPendingProfile(selected);
     replayTargets.add(target);
     try {
       target.click();
@@ -1435,10 +1713,10 @@
     }
     if (profile.model) next.model = profile.model;
     if (profile.modelProvider) next.modelProvider = profile.modelProvider;
-    if (typeof profile.developerInstructions === "string") {
+    if (typeof profile.developerInstructions === "string" && profile.developerInstructions.trim()) {
       next.developerInstructions = profile.developerInstructions;
     }
-    if (typeof profile.baseInstructions === "string") {
+    if (typeof profile.baseInstructions === "string" && profile.baseInstructions.trim()) {
       next.baseInstructions = profile.baseInstructions;
     }
     const hasUnifiedPermissions = Object.hasOwn(next, "permissions") && next.permissions != null;
@@ -1484,7 +1762,20 @@
 
   async function profilePayloadDigest(profile) {
     try {
-      const encoded = new TextEncoder().encode(JSON.stringify(canonicalizeForDigest({
+      const signature = profileSignature(profile);
+      const encoded = new TextEncoder().encode(signature);
+      const digest = await crypto.subtle.digest("SHA-256", encoded);
+      const result = "sha256:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      const entry = profileDigests.get(profile?.id || "base");
+      if (!destroyed && entry?.signature === signature) entry.digest = result;
+      return result;
+    } catch {
+      return null;
+    }
+  }
+
+  function profileSignature(profile) {
+    return JSON.stringify(canonicalizeForDigest({
         id: profile?.id || "base",
         model: profile?.model || "",
         modelProvider: profile?.modelProvider || "",
@@ -1495,12 +1786,24 @@
         sandbox: profile?.sandbox || "",
         serviceTier: profile?.serviceTier || "",
         memoryPolicy: profile?.memoryPolicy || {},
-      })));
-      const digest = await crypto.subtle.digest("SHA-256", encoded);
-      return "sha256:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    } catch {
-      return null;
+    }));
+  }
+
+  function proofMatchesProfile(proof, profileId) {
+    if (proof?.profileId !== profileId || !proof?.payloadDigest
+        || profileDigests.get(profileId)?.digest !== proof.payloadDigest) return false;
+    if (proof.transport === "native-thread-settings-profile-switch") {
+      const threadId = Object.entries(state.proofByThread).find(([, entry]) => entry.proofId === proof.proofId)?.[0];
+      const target = threadId && findSwitchController(threadId);
+      const mode = target?.conversation?.latestCollaborationMode;
+      const text = mode?.settings?.developer_instructions;
+      if (mode?.mode !== "default" || !isManagedProfileInstructions(text)) return false;
+      try {
+        const data = JSON.parse(text.slice(text.lastIndexOf("\n") + 1));
+        return data.applicationId === proof.proofId && data.profileId === profileId;
+      } catch { return false; }
     }
+    return true;
   }
 
   function recordThreadProof(threadId, proof) {
@@ -1510,7 +1813,7 @@
     state.proofByThread[id] = {
       proofId,
       profileId: validProfileId(proof.profileId),
-      profileRevision: Number(environmentStore.revision || 0),
+      profileRevision: Number(proof.profileRevision ?? environmentStore.revision ?? 0),
       status: String(proof.status || "acknowledged"),
       method: String(proof.method || ""),
       transport: String(proof.transport || ""),
@@ -1647,9 +1950,27 @@
     return "";
   }
 
-  function observePendingProfileForTurn(type, payload) {
+  function observePendingProfileForTurn(type, payload, confirmed = true) {
+    if (destroyed || !confirmed) return;
+    // Reading turn/start is observational only: never rewrite its model,
+    // permissions, or content. Consume a prewarm choice only once actually used.
+    const observedId = turnStartThreadId(type, payload);
+    const binding = observedId && threadProfileEntry(observedId);
+    const proof = observedId && state.proofByThread[observedId];
+    const eligible = observedId && eligiblePrewarms.get(observedId);
+    if (binding?.profileId === state.pendingProfileId && binding.applied === true
+        && eligible?.epoch === selectionEpoch && eligible.profileId === binding.profileId
+        && eligible.signature === profileSignature(profileById(binding.profileId))
+        && proof?.status === "acknowledged" && binding.proofId === proof.proofId
+        && proofMatchesProfile(proof, binding.profileId)) {
+      eligiblePrewarms.delete(observedId);
+      consumeObservedSelection(binding.profileId);
+      pendingThreadObservation = null;
+      return;
+    }
     const pending = pendingThreadObservation;
     if (!pending) return;
+    if (pending.epoch !== selectionEpoch) { pendingThreadObservation = null; return; }
     if (Date.now() - pending.at > 2 * 60_000) {
       pendingThreadObservation = null;
       return;
@@ -1659,15 +1980,15 @@
     pendingThreadObservation = null;
     const existing = threadProfileEntry(threadId);
     if (existing?.profileId === pending.profileId) {
-      consumePendingProfile(pending.profileId);
+      consumeObservedSelection(pending.profileId);
       showToast(existing.applied === true
         ? `环境已确认：${profileDisplayName(pending.profileId)}`
         : `已记录会话环境：${profileDisplayName(pending.profileId)}（未确认注入）`);
       return;
     }
     if (!existing) {
-      bindThreadProfile(threadId, pending.profileId, { applied: false, source: "direct-rpc-turn-start" });
-      consumePendingProfile(pending.profileId);
+      persistObservedBinding(threadId, pending.profileId, { applied: false, source: "direct-rpc-turn-start" });
+      consumeObservedSelection(pending.profileId);
       showToast(`已记录会话环境：${profileDisplayName(pending.profileId)}（未确认注入）`);
       traceRequest("direct-rpc-thread-observed", { threadId, profileId: pending.profileId });
     }
@@ -1709,15 +2030,19 @@
     }
     const threadId = findThreadId(payload) || findThreadId({ params: payload });
     if (!threadId) return;
-    bindThreadProfile(threadId, pending.profileId, { applied: true, source: "dispatcher-thread-started" });
-    if (pending.kind === "thread/start") consumePendingProfile(pending.profileId);
-    showToast(`会话环境：${pending.profileName}`);
-    traceRequest("thread-started", { kind: pending.kind, profileId: pending.profileId, threadId });
+    // This broadcast carries no matching request identity. It must not bind an
+    // unrelated thread or fabricate acknowledgment; direct RPC owns that proof.
+    showToast("观察到会话创建通知，环境转发尚未确认");
+    traceRequest("dispatcher-thread-observed-unconfirmed", { kind: pending.kind, profileId: pending.profileId, threadId });
     pendingStartBinding = null;
   }
 
   function traceRequest(stage, details = {}) {
-    requestTrace.push({ at: new Date().toISOString(), stage, ...details });
+    if (destroyed) return;
+    // Upstream errors may echo instructions, configuration or credentials.
+    const safe = { ...details };
+    if (Object.hasOwn(safe, "error")) safe.error = "请求失败（原始错误内容已隐藏）";
+    requestTrace.push({ at: new Date().toISOString(), stage, ...safe });
     if (requestTrace.length > 24) requestTrace.splice(0, requestTrace.length - 24);
   }
 
@@ -1841,7 +2166,8 @@
     if (member.descriptor.writable === false || member.descriptor.configurable === false) return null;
     let source = "";
     try { source = Function.prototype.toString.call(member.descriptor.value); } catch {}
-    if (!source.includes("enqueueRequest") && !source.includes("sendConfigReadRequest")) return null;
+    const alreadyWrapped = member.descriptor.value?.[WRAPPER_MARK] === wrapperToken;
+    if (!alreadyWrapped && !source.includes("enqueueRequest") && !source.includes("sendConfigReadRequest")) return null;
     return {
       controller: value,
       client: requestClient,
@@ -1860,24 +2186,30 @@
     if (descriptor.writable === false || descriptor.configurable === false) return false;
     if (descriptor.value?.[WRAPPER_MARK] === wrapperToken) return false;
     const previous = descriptor.value;
-    const wrapped = async function codexEnvironmentPrewarmThreadStart(request, options) {
+    const wrapped = async function codexEnvironmentPrewarmThreadStart(request, ...rest) {
       const profileId = state.pendingProfileId;
-      if (!profileId) return previous.call(this, request, options);
+      if (destroyed || !profileId || request?.[INJECTED_PARAMS_MARK] === true)
+        return previous.call(this, request, ...rest);
       const profile = profileById(profileId);
+      const pendingEpoch = selectionEpoch;
+      const signature = profileSignature(profile);
+      const profileRevision = Number(environmentStore.revision || 0);
       const patchedRequest = markInjectedParams(applyProfileToParams(request, profile));
       const fields = injectedFieldsFromParams(request, patchedRequest);
       const dispatchedAt = new Date().toISOString();
       const digestPromise = profilePayloadDigest(profile);
       traceRequest("prewarm-environment-dispatched", { profileId: profile.id, fields });
       try {
-        const result = await previous.call(this, patchedRequest, options);
-        const threadId = findThreadId(result) || findThreadId(patchedRequest);
+        const result = await previous.call(this, patchedRequest, ...rest);
+        const threadId = findThreadId(result);
         const payloadDigest = await digestPromise;
+        if (destroyed) return result;
         if (threadId) {
           const acknowledgedAt = new Date().toISOString();
           const proofId = recordThreadProof(threadId, {
             profileId: profile.id,
-            status: "acknowledged",
+            profileRevision,
+            status: payloadDigest ? "acknowledged" : "observed-unconfirmed",
             method: "thread/start",
             transport: "prewarm-thread-start-prototype",
             fields,
@@ -1885,13 +2217,18 @@
             dispatchedAt,
             acknowledgedAt,
           });
-          bindThreadProfile(threadId, profile.id, {
-            applied: true,
+          if (!persistObservedBinding(threadId, profile.id, {
+            applied: !!payloadDigest,
             source: "prewarm-thread-start-prototype",
             proofId,
-          });
-          showToast(`环境预热完成：${profile.name}`);
-          traceRequest("prewarm-environment-acknowledged", { threadId, profileId: profile.id, proofId });
+          })) return result;
+          showToast(`环境预热${payloadDigest ? "转发已确认" : "证明不完整"}：${profile.name}`);
+          if (pendingEpoch === selectionEpoch && state.pendingProfileId === profile.id
+              && signature === profileSignature(profileById(profile.id))) {
+            eligiblePrewarms.set(threadId, { epoch: pendingEpoch, profileId: profile.id, signature });
+          }
+          traceRequest(payloadDigest ? "prewarm-environment-acknowledged" : "prewarm-environment-unconfirmed",
+            { threadId, profileId: profile.id, proofId });
         }
         return result;
       } catch (error) {
@@ -1928,9 +2265,12 @@
     if (descriptor.value?.[WRAPPER_MARK] === wrapperToken) return prewarmPatched;
     const previous = descriptor.value;
     const wrapped = async function codexEnvironmentSendRequest(method, params, ...rest) {
+      if (destroyed) return previous.call(this, method, params, ...rest);
       const descriptorInfo = requestDescriptor(method, params);
-      if (!descriptorInfo || descriptorInfo.prewarm) {
-        return previous.call(this, method, params, ...rest);
+      if (!descriptorInfo || descriptorInfo.prewarm || descriptorInfo.params?.[INJECTED_PARAMS_MARK] === true) {
+        const result = await previous.call(this, method, params, ...rest);
+        observePendingProfileForTurn(method, params);
+        return result;
       }
       let profileId = "";
       if (descriptorInfo.kind === "thread/start") {
@@ -1942,21 +2282,54 @@
         profileId = threadProfileId(descriptorInfo.params?.threadId) || state.pendingProfileId || "base";
       }
       const profile = profileById(profileId || "base");
+      const profileRevision = Number(environmentStore.revision || 0);
+      const resumeId = descriptorInfo.kind === "thread/resume"
+        ? normalizedThreadId(descriptorInfo.params?.threadId) : "";
+      const requestToken = {};
+      if (resumeId) resumeRequests.set(resumeId, requestToken);
+      const canRecord = () => !destroyed && (!resumeId || resumeRequests.get(resumeId) === requestToken);
       const patchedParams = markInjectedParams(applyProfileToParams(descriptorInfo.params, profile));
       const nextParams = descriptorInfo.rebuild(patchedParams);
       const fields = injectedFieldsFromParams(descriptorInfo.params, patchedParams);
       const dispatchedAt = new Date().toISOString();
       const digestPromise = profilePayloadDigest(profile);
       traceRequest("direct-rpc-dispatched", { method: String(method || ""), profileId: profile.id, fields });
+      if (resumeId) {
+        const proofId = recordThreadProof(resumeId, {
+          profileId: profile.id, profileRevision, status: "dispatched",
+          method: descriptorInfo.kind, transport: "app-server-request-client-prototype",
+          fields, dispatchedAt,
+        });
+        persistObservedBinding(resumeId, profile.id, {
+          applied: false, source: "app-server-request-client-prototype", proofId,
+        });
+      }
       try {
         const result = await previous.call(this, method, nextParams, ...rest);
-        const threadId = findThreadId(result) || findThreadId(patchedParams);
+        let threadId = findThreadId(result) || resumeId;
+        // A fork's input id is its parent, not evidence of a new child.
+        if (descriptorInfo.kind === "thread/fork"
+            && threadId === normalizedThreadId(descriptorInfo.params?.threadId)) threadId = "";
         const payloadDigest = await digestPromise;
+        if (!canRecord()) return result;
+        if (resumeId && threadId !== resumeId) {
+          const proofId = recordThreadProof(resumeId, {
+            profileId: profile.id, profileRevision, status: "observed-unconfirmed",
+            method: descriptorInfo.kind, transport: "app-server-request-client-prototype",
+            fields, payloadDigest, dispatchedAt,
+          });
+          persistObservedBinding(resumeId, profile.id, {
+            applied: false, source: "app-server-request-client-prototype", proofId,
+          });
+          traceRequest("direct-rpc-response-thread-mismatch", { method: descriptorInfo.kind, profileId: profile.id });
+          return result;
+        }
         if (threadId) {
           const acknowledgedAt = new Date().toISOString();
           const proofId = recordThreadProof(threadId, {
             profileId: profile.id,
-            status: "acknowledged",
+            profileRevision,
+            status: payloadDigest ? "acknowledged" : "observed-unconfirmed",
             method: descriptorInfo.kind,
             transport: "app-server-request-client-prototype",
             fields,
@@ -1964,20 +2337,38 @@
             dispatchedAt,
             acknowledgedAt,
           });
-          bindThreadProfile(threadId, profile.id, {
-            applied: true,
+          if (!persistObservedBinding(threadId, profile.id, {
+            applied: !!payloadDigest,
             source: "app-server-request-client-prototype",
             proofId,
-          });
-          if (descriptorInfo.kind === "thread/start") consumePendingProfile(profile.id);
+          })) return result;
+          if (descriptorInfo.kind === "thread/start") consumeObservedSelection(profile.id);
           pendingThreadObservation = null;
-          showToast(`环境已注入：${profile.name}`);
-          traceRequest("direct-rpc-acknowledged", { threadId, profileId: profile.id, proofId });
+          showToast(`环境${payloadDigest ? "转发已确认" : "证明不完整"}：${profile.name}`);
+          traceRequest(payloadDigest ? "direct-rpc-acknowledged" : "direct-rpc-unconfirmed",
+            { threadId, profileId: profile.id, proofId });
+        } else {
+          traceRequest("direct-rpc-unconfirmed", { method: descriptorInfo.kind, profileId: profile.id });
         }
         return result;
       } catch (error) {
+        if (resumeId && canRecord()) {
+          const payloadDigest = await digestPromise;
+          if (canRecord()) {
+            const proofId = recordThreadProof(resumeId, {
+              profileId: profile.id, profileRevision, status: "failed",
+              method: descriptorInfo.kind, transport: "app-server-request-client-prototype",
+              fields, payloadDigest, dispatchedAt,
+            });
+            persistObservedBinding(resumeId, profile.id, {
+              applied: false, source: "app-server-request-client-prototype", proofId,
+            });
+          }
+        }
         traceRequest("direct-rpc-error", { method: String(method || ""), profileId: profile.id, error: String(error?.message || error) });
         throw error;
+      } finally {
+        if (resumeId && resumeRequests.get(resumeId) === requestToken) resumeRequests.delete(resumeId);
       }
     };
     Object.defineProperty(wrapped, WRAPPER_MARK, { value: wrapperToken });
@@ -2016,7 +2407,7 @@
     const previous = descriptor.value;
     const wrapped = function codexProfileSelectorDispatchMessage(type, payload) {
       const rawType = String(type || "");
-      observePendingProfileForTurn(type, payload);
+      observePendingProfileForTurn(type, payload, false);
       let prepared = null;
       try {
         prepared = prepareDispatcherRequest(type, payload);
@@ -2075,7 +2466,27 @@
   }
 
   function patchClient(value) {
+    if (destroyed) return false;
     return patchDirectRpcTarget(value) || patchDispatcher(value);
+  }
+
+  function waitForAsset(promise) {
+    return new Promise(resolve => {
+      if (destroyed) { resolve(null); return; }
+      let done = false;
+      let timer = 0;
+      const finish = value => {
+        if (done) return;
+        done = true;
+        window.clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      };
+      const abort = () => finish(null);
+      signal.addEventListener("abort", abort, { once: true });
+      timer = window.setTimeout(() => finish(null), 2000);
+      Promise.resolve(promise).then(finish, () => finish(null));
+    });
   }
 
   function patchedClientDiagnostics() {
@@ -2212,23 +2623,28 @@
     scanAttempts += 1;
     let patched = 0;
     try {
+      patched += patchFromReactFibers();
       for (const url of preferredAssetUrls()) {
         try {
-          const module = await importAsset(url);
+          const module = await waitForAsset(importAsset(url));
+          if (destroyed) return;
+          if (!module) continue;
           for (const candidate of moduleCandidates(module)) {
             healLegacySendRequestShadow(candidate);
             if (patchClient(candidate)) patched += 1;
           }
         } catch {}
       }
+      if (destroyed) return;
       patched += patchFromReactFibers();
       lastPatchError = "";
     } catch (error) {
       lastPatchError = String(error?.stack || error?.message || error);
     } finally {
       scanInFlight = false;
-      updatePill();
+      if (!destroyed) updatePill();
     }
+    if (destroyed) return;
     const delay = patched > 0 || patchedClients.size > 0
       ? 30000
       : Math.min(15000, 500 * Math.max(1, scanAttempts));
@@ -2253,6 +2669,14 @@
     }
     patchedClients.clear();
     environmentControllers.clear();
+    resumeRequests.clear();
+    eligiblePrewarms.clear();
+    for (const op of profileSwitches.values()) { try { op.listenerDispose?.(); } catch {} }
+    profileSwitches.clear();
+    profileSwitchResults.clear();
+    profileSwitchSelections.clear();
+    activeMemoryEditor = null;
+    activeAgentsEditor = null;
     try { uiAdapter?.destroy?.(); } catch {}
     uiAdapter = null;
     host?.remove();
@@ -2261,6 +2685,215 @@
       delete window[LEGACY_GLOBAL_KEY];
     }
     if (currentApi?.version === VERSION) delete window[GLOBAL_KEY];
+  }
+
+  function buildProfileInstructions(profile, applicationId) {
+    return "# Codex++ Active Conversation Profile\n"
+      + "The user explicitly selected the active conversation profile below. Earlier custom profile-specific roles and output-format rules are superseded by this selection. "
+      + "Platform and safety instructions, AGENTS guidance, and current user requests remain effective. Base adds no custom profile rules. Do not explain this control block.\n"
+      + JSON.stringify({ applicationId, profileId: profile.id, instructions: profile.developerInstructions || "" });
+  }
+
+  function isManagedProfileInstructions(text) {
+    if (typeof text !== "string" || text.length > 120000 || !text.startsWith("# Codex++ Active Conversation Profile\n")) return false;
+    try {
+      const data = JSON.parse(text.slice(text.lastIndexOf("\n") + 1));
+      return typeof data.applicationId === "string" && data.applicationId.startsWith("apply-")
+        && typeof data.profileId === "string" && typeof data.instructions === "string"
+        && text === buildProfileInstructions({ id: data.profileId, developerInstructions: data.instructions }, data.applicationId);
+    } catch { return false; }
+  }
+
+  function findSwitchController(threadId) {
+    const candidates = [];
+    for (const controller of environmentControllers) {
+      if (ownValue(controller, "disposed") === true || ownValue(controller, "hostId") !== "local") continue;
+      const methods = {};
+      for (const name of ["getConversation", "getThreadExecutionState", "getStreamRole", "runThreadSettingsUpdate", "updateConversationState"])
+        methods[name] = callableMember(controller, name)?.descriptor?.value;
+      if (Object.values(methods).some(method => typeof method !== "function")) continue;
+      try {
+        const conversation = methods.getConversation.call(controller, threadId);
+        if (!conversation || normalizedThreadId(conversation.id) !== threadId) continue;
+        const getRole = callableMember(controller, "getStreamRole")?.descriptor?.value;
+        if (!getRole || getRole.call(controller, threadId)?.role !== "owner") continue;
+        const client = ownValue(controller, "requestClient");
+        if (!client || typeof callableMember(client, "sendRequest")?.descriptor?.value !== "function") continue;
+        candidates.push({ controller, client, methods, conversation });
+      } catch {}
+    }
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  function currentSwitchStatus(threadId) {
+    const op = profileSwitches.get(threadId);
+    if (op) return {
+      busy: !op.quarantined, available: false, blocked: !!op.quarantined,
+      phase: op.phase, profileId: op.profile.id,
+      reason: op.quarantined ? "更新结果未知，暂不允许重复切换；等待迟到响应或重开应用后核对" : "正在切换",
+      result: profileSwitchResults.get(threadId) || null,
+    };
+    const target = threadId ? findSwitchController(threadId) : null;
+    let inProgress = false;
+    try { inProgress = target?.methods.getThreadExecutionState.call(target.controller, threadId)?.inProgress === true; } catch { inProgress = true; }
+    const mode = target?.conversation?.latestCollaborationMode?.mode || "default";
+    const otherInstructions = target?.conversation?.latestCollaborationMode?.settings?.developer_instructions;
+    const conflict = mode !== "default" || (otherInstructions?.trim() && !isManagedProfileInstructions(otherInstructions));
+    return {
+      busy: false, available: !!target && !inProgress && !conflict,
+      reason: !target ? "请先打开一个已加载的本地会话" : inProgress ? "请等待当前生成结束" : conflict ? "请先恢复默认协作模式，再应用 Profile" : "",
+      result: profileSwitchResults.get(threadId) || null,
+    };
+  }
+
+  async function switchThreadProfile(threadId, requestedProfileId) {
+    const id = normalizedThreadId(threadId);
+    if (destroyed || !id) throw new Error("注入器不可用或未选择会话");
+    if (!profileMap.has(requestedProfileId)) throw new Error("目标环境不存在");
+    if (profileSwitches.has(id)) throw new Error("该会话仍在切换或等待未知结果，请勿重复提交");
+    const profile = cloneJson(profileById(requestedProfileId));
+    assertSafeProfile({ ...profile, id: profile.id.startsWith("studio:") ? profile.id.slice(7) : profile.id });
+    const target = findSwitchController(id);
+    if (!target) throw new Error("请先在当前窗口打开一个本地会话");
+    const { controller, client, methods } = target;
+    const previous = threadProfileEntry(id);
+    if (profile.baseInstructions?.trim() || (previous && profileById(previous.profileId).baseInstructions?.trim()))
+      throw new Error("Base Instructions 不能原地替换或撤销，请新建会话");
+    const safeErrors = new WeakSet();
+    const safeError = text => { const error = new Error(text); safeErrors.add(error); return error; };
+    const op = { threadId: id, profile, signature: profileSignature(profile), phase: "queued",
+      controller, client, dispatched: false, updateInvoked: false, serverAcknowledged: false,
+      transportFulfilled: false, cancelled: false, quarantined: false, listenerDispose: null };
+    const alive = () => {
+      if (destroyed || op.cancelled || profileSwitches.get(id) !== op) throw safeError("操作已取消或超时，结果未确认");
+    };
+    const check = () => {
+      alive();
+      const latest = methods.getConversation.call(controller, id);
+      if (!latest || methods.getStreamRole.call(controller, id)?.role !== "owner") throw safeError("会话已由其他窗口接管，请重新打开");
+      if (methods.getThreadExecutionState.call(controller, id)?.inProgress === true) throw safeError("会话正在执行，请等待结束");
+      if (latest.threadStartKind === "realtime_voice" || latest.threadSource === "voice_chat") throw safeError("语音会话不支持热切");
+      if ((latest.latestCollaborationMode?.mode || "default") !== "default") throw safeError("请先退出 Plan 模式");
+      const instructions = latest.latestCollaborationMode?.settings?.developer_instructions;
+      if (instructions?.trim() && !isManagedProfileInstructions(instructions)) throw safeError("存在其他自定义协作指令，不能自动覆盖");
+      if (op.signature !== profileSignature(profileById(profile.id))) throw safeError("目标 Profile 已变化，请重新选择");
+      return latest;
+    };
+    profileSwitches.set(id, op);
+    updatePill();
+    let timer = 0;
+    try {
+      const queued = methods.runThreadSettingsUpdate.call(controller, id, async () => {
+        op.phase = "checking";
+        check();
+        const metadata = await client.sendRequest("thread/read", { threadId: id, includeTurns: false }, { priority: "critical", timeoutMs: 5000 });
+        check();
+        if (findThreadId(metadata) !== id || metadata?.thread?.status?.type !== "idle") throw safeError("服务器会话不是空闲状态");
+        if (profile.modelProvider && profile.modelProvider !== metadata.thread.modelProvider) throw safeError("Provider 不同，请新建会话使用该 Profile");
+        const digest = await profilePayloadDigest(profile);
+        const latest = check();
+        const model = profile.model || latest.latestModel || metadata.thread.model;
+        if (!model) throw safeError("无法确认当前模型");
+        const effort = profile.config?.model_reasoning_effort
+          || (Object.hasOwn(latest, "latestReasoningEffort") ? latest.latestReasoningEffort : metadata.thread.reasoningEffort) || null;
+        const applicationId = `apply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        const instructions = buildProfileInstructions(profile, applicationId);
+        const settings = {
+          model, effort,
+          collaborationMode: { mode: "default", settings: { model, reasoning_effort: effort, developer_instructions: instructions } },
+          ...(profile.serviceTier ? { serviceTier: profile.serviceTier } : {}),
+        };
+        const listen = callableMember(client, "addRequestLifecycleListener")?.descriptor?.value;
+        if (!listen) throw safeError("客户端无法提供设置请求的关联证明");
+        const revision = Number(environmentStore.revision || 0);
+        const dispatchedAt = new Date().toISOString();
+        const pendingProof = {
+          proofId: applicationId, profileId: profile.id, profileRevision: revision,
+          method: "thread/settings/update", transport: "native-thread-settings-profile-switch",
+          fields: Object.keys(settings), payloadDigest: digest, dispatchedAt,
+        };
+        recordThreadProof(id, { ...pendingProof, status: "planned" });
+        if (!persistObservedBinding(id, previous?.profileId || "base", {
+          applied: false, source: "profile-switch-pending", proofId: applicationId,
+        })) throw safeError("无法保存待确认状态，未发送设置更新");
+        op.phase = "applying";
+        op.listenerDispose = listen.call(client, event => {
+          if (destroyed || op.cancelled || profileSwitches.get(id) !== op || event.method !== "thread/settings/update") return;
+          if (event.type === "started" && event.params?.threadId === id
+              && event.params?.collaborationMode?.settings?.developer_instructions === instructions) {
+            op.requestId = event.id; op.dispatched = true;
+          }
+          if (event.type === "completed" && op.requestId != null && event.id === op.requestId) op.serverAcknowledged = true;
+        });
+        check();
+        updatePill();
+        const settingsBefore = methods.getConversation.call(controller, id)?.latestThreadSettings;
+        op.updateInvoked = true;
+        await client.sendRequest("thread/settings/update", { threadId: id, ...settings }, { priority: "critical", timeoutMs: 10000 });
+        op.transportFulfilled = true;
+        alive();
+        if (!op.serverAcknowledged) throw safeError("设置响应未能关联，当前状态未确认");
+        // Same native queue, and the same fields used by the native settings reducer.
+        if (methods.getConversation.call(controller, id)?.latestThreadSettings === settingsBefore) {
+          methods.updateConversationState.call(controller, id, value => {
+            value.latestThreadSettings = { ...value.latestThreadSettings, ...settings };
+            value.latestModel = model;
+            value.latestReasoningEffort = effort;
+            value.latestCollaborationMode = settings.collaborationMode;
+          });
+        }
+        const proofId = recordThreadProof(id, {
+          ...pendingProof, status: digest ? "acknowledged" : "observed-unconfirmed", acknowledgedAt: new Date().toISOString(),
+        });
+        const persisted = persistObservedBinding(id, profile.id, {
+          applied: !!digest, source: "native-thread-settings-profile-switch", proofId,
+        });
+        const confirmed = persisted && !!digest && proofMatchesProfile(state.proofByThread[id], profile.id);
+        const deferredFields = [];
+        if (Object.keys(profile.config || {}).some(key => key !== "model_reasoning_effort")) deferredFields.push("附加 Config");
+        if (profile.memoryPolicy && [profile.memoryPolicy.use, profile.memoryPolicy.generate].some(value => value && value !== "inherit")) deferredFields.push("记忆初始化策略");
+        if (profile.approvalPolicy || profile.sandbox) deferredFields.push("现有权限配置");
+        const summary = {
+          status: confirmed ? "acknowledged" : "unconfirmed", threadId: id, profileId: profile.id,
+          proofId: confirmed ? proofId : null,
+          nativeModel: methods.getConversation.call(controller, id)?.latestModel || model, deferredFields,
+          message: confirmed ? `热切项已应用：Developer、模型、推理和已指定的 Service Tier。${deferredFields.length ? `未热更新：${deferredFields.join("、")}。` : ""}历史和后台服务保留。`
+            : "请求已返回，但当前版本或本地证明未确认，请核对后再操作",
+        };
+        profileSwitchResults.set(id, summary);
+        return summary;
+      });
+      const settled = () => {
+        if (op.quarantined && op.transportFulfilled && !destroyed && profileSwitches.get(id) === op) {
+          profileSwitches.delete(id);
+          profileSwitchResults.set(id, { status: "unconfirmed", threadId: id, profileId: profile.id,
+            message: "迟到请求已经返回；旧状态仍未确认，可重新核对并应用" });
+          updatePill();
+        }
+      };
+      Promise.resolve(queued).then(settled, settled);
+      const deadline = new Promise((_, reject) => {
+        timer = window.setTimeout(() => {
+          op.cancelled = true;
+          reject(safeError(op.updateInvoked ? "更新结果未知，已禁止重复切换；请等待请求返回或重开应用后核对" : "原生设置队列超时；已取消本次切换"));
+        }, 15000);
+      });
+      return await Promise.race([queued, deadline]);
+    } catch (error) {
+      op.cancelled = true;
+      op.quarantined = op.updateInvoked && !op.transportFulfilled;
+      op.phase = op.quarantined ? "outcome-unknown" : "failed";
+      const message = safeErrors.has(error) ? error.message : op.quarantined
+        ? "更新结果未知，已禁止重复切换；重开应用后请先核对" : "切换失败，未确认更新";
+      if (!destroyed) profileSwitchResults.set(id, { status: "unconfirmed", threadId: id, profileId: profile.id, message });
+      throw new Error(message);
+    } finally {
+      window.clearTimeout(timer);
+      try { op.listenerDispose?.(); } catch {}
+      if (profileSwitches.get(id) === op && !op.quarantined) profileSwitches.delete(id);
+      while (profileSwitchResults.size > MAX_THREAD_ENTRIES) profileSwitchResults.delete(profileSwitchResults.keys().next().value);
+      if (!destroyed) updatePill();
+    }
   }
 
   function publicStatus() {
@@ -2275,9 +2908,11 @@
     return {
       name: "环境注入器",
       version: VERSION,
+      runtimeBuild: "0.4.0",
       generatedAt: ENVIRONMENT_BUNDLE.generatedAt || "",
       profiles: profiles.map(({ id, name, model, modelProvider, source }) => ({ id, name, model, modelProvider, source })),
       currentThreadId: currentId,
+      currentSwitch: currentSwitchStatus(currentId),
       currentProfileId: currentProfile,
       currentProfileBinding: currentEntry ? {
         profileId: currentEntry.profileId,
@@ -2287,6 +2922,9 @@
         at: currentEntry.at || null,
       } : null,
       currentProof: currentProof ? {
+        profileId: currentProof.profileId,
+        profileRevision: currentProof.profileRevision,
+        matchesCurrentProfile: proofMatchesProfile(currentProof, currentProfile),
         proofId: currentProof.proofId,
         status: currentProof.status,
         transport: currentProof.transport,
@@ -2317,6 +2955,7 @@
 
   function refreshEnvironmentData() {
     environmentStore = loadEnvironmentStore();
+    lastCommittedStore = cloneJson(environmentStore);
     refreshProfileCatalog();
     state = loadState();
     renderProfileOptions();
@@ -2409,17 +3048,22 @@
       await refreshBridgeState();
       return uiSnapshot();
     },
-    replaceEnvironmentStore: (nextStore) => {
-      environmentStore = normalizeEnvironmentStore(cloneJson(nextStore));
-      saveEnvironmentStore();
-      refreshProfileCatalog();
-      state = loadState();
-      renderProfileOptions();
-      updatePill();
-      return uiSnapshot();
-    },
+    replaceEnvironmentStore: installEnvironmentStore,
     updateUiPreferences: (patch) => {
-      if (isObject(patch)) Object.assign(environmentStore.ui, cloneJson(patch));
+      if (isObject(patch)) {
+        const nextUi = { ...environmentStore.ui };
+        for (const [key, value] of Object.entries(patch)) {
+          if (!["agentsDraft", "memoryCorrectionDraft", "panelExpanded"].includes(key)) throw new Error("未知界面设置");
+          if (value === undefined) delete nextUi[key];
+          else {
+            if (key === "panelExpanded") {
+              if (typeof value !== "boolean") throw new Error("面板设置必须为布尔值");
+            } else assertSafeDraft(value);
+            nextUi[key] = cloneJson(value, value);
+          }
+        }
+        environmentStore.ui = nextUi;
+      }
       saveEnvironmentStore();
       notifyUiAdapter();
       return uiSnapshot();
@@ -2429,6 +3073,11 @@
       saveState();
       return uiSnapshot();
     },
+    switchThreadProfile,
+    threadSwitchStatus: threadId => currentSwitchStatus(normalizedThreadId(threadId)),
+    saveProfile: saveEnvironmentProfile,
+    validateProfileData: assertSafeProfile,
+    validateDraftData: assertSafeDraft,
     open: () => chooseProfile("下个新对话环境"),
     viewCurrent: openCurrentProfileView,
     viewMemory: openMemoryView,
@@ -2439,6 +3088,9 @@
       return publicStatus();
     },
     clearNext: () => {
+      selectionEpoch += 1;
+      eligiblePrewarms.clear();
+      discardPrewarmedThreads();
       state.pendingProfileId = "";
       saveState();
       return publicStatus();
@@ -2454,19 +3106,20 @@
   window[LEGACY_GLOBAL_KEY] = publicApi;
 })();
 
-/* Codex++ Environment Studio v0.3.2 */
+/* Codex++ Environment Studio v0.4.0 */
 (() => {
   "use strict";
 
   const GLOBAL_KEY = "__codexEnvironmentStudio";
   const LEGACY_GLOBAL_KEY = "__codexPlusProfileStudio";
   const INJECTOR_GLOBAL_KEY = "__codexEnvironmentInjector";
-  const VERSION = "0.3.2";
+  const VERSION = "0.4.0";
   const STORAGE_KEY = "codexpp.environmentInjector.v2";
   const LEGACY_STORAGE_KEY = "codexpp.profileStudio.v1";
   const STORE_VERSION = 2;
   const UPDATE_EVENT = "codexpp-environment-injector-updated";
   const NAV_ATTR = "data-codex-environment-injector-nav";
+  const STATUS_NAV_ATTR = "data-codex-environment-status-nav";
   const HOST_ID = "codexpp-environment-studio-host";
   const MAX_PROFILES = 50;
   const MAX_INSTRUCTIONS_CHARS = 40000;
@@ -2483,8 +3136,10 @@
   let shadow = null;
   let dialog = null;
   let navNode = null;
+  let statusNavNode = null;
   let observer = null;
   let scanTimer = 0;
+  let statusTimer = 0;
   let uiAdapter = null;
   let selectedKey = "";
   let selectedTargetProfileId = "";
@@ -2533,15 +3188,10 @@
   let store = loadStore();
 
   function saveStore() {
-    store.revision = Number(store.revision || 0) + 1;
-    store.updatedAt = new Date().toISOString();
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
-    } catch (error) {
-      throw new Error(`保存环境失败：${error?.message || error}`);
-    }
-    window.dispatchEvent(new CustomEvent(UPDATE_EVENT));
-    window[INJECTOR_GLOBAL_KEY]?.refreshProfiles?.();
+    const injector = window[INJECTOR_GLOBAL_KEY];
+    if (!injector?.replaceEnvironmentStore) throw new Error("环境核心不可用");
+    injector.replaceEnvironmentStore(store);
+    store = loadStore();
     renderProfileList();
   }
 
@@ -2821,19 +3471,26 @@
     if (likelyContainsSecret(profile.developerInstructions)
         || likelyContainsSecret(profile.baseInstructions)
         || likelyContainsSecretValue(profile.config)) {
-      if (!window.confirm("环境内容可能包含密钥、Token 或认证字段。仍要保存到 Codex 页面 localStorage 吗？")) {
-        return;
-      }
+      setStatus("敏感字段不允许保存到环境，请改用环境变量名或凭据存储", "error");
+      return;
     }
     const nextKey = storageKeyFor(profile);
-    if (selectedKey && selectedKey !== nextKey) delete store.profiles[selectedKey];
-    store.profiles[nextKey] = profile;
+    try {
+      const injector = window[INJECTOR_GLOBAL_KEY];
+      if (!injector?.saveProfile) throw new Error("环境核心不可用");
+      injector.saveProfile(profile, { previousKey: selectedKey, expectedRevision: store.revision });
+      store = loadStore();
+    } catch {
+      setStatus("保存失败：环境冲突、数据不安全或存储不可写，请重新加载检查", "error");
+      return;
+    }
     selectedKey = nextKey;
     selectedTargetProfileId = String(profile.targetProfileId || "");
     sourceConfig = cloneJson(profile.config || {});
-    saveStore();
     if (ui.useNext.checked) {
-      window[INJECTOR_GLOBAL_KEY]?.setNext?.(selectorProfileId(profile));
+      try { window[INJECTOR_GLOBAL_KEY]?.setNext?.(selectorProfileId(profile)); } catch {
+        setStatus("环境已保存，但下次环境选择保存失败", "error"); return;
+      }
     }
     fillForm({ ...profile, storageKey: nextKey, sourceKind: profile.targetProfileId ? "override" : "studio" });
     if (profile.targetProfileId) {
@@ -2852,7 +3509,9 @@
       : `删除自定义 Profile“${profile.name || profile.id}”？`;
     if (!window.confirm(prompt)) return;
     delete store.profiles[selectedKey];
-    saveStore();
+    try { saveStore(); } catch {
+      store = loadStore(); setStatus("删除未保存，请重新加载检查", "error"); return;
+    }
     clearForm();
     setStatus(isOverride
       ? `已恢复文件 Profile：${profile.targetProfileId}`
@@ -2932,6 +3591,11 @@
       setStatus(error, "error");
       return;
     }
+    try {
+      const injector = window[INJECTOR_GLOBAL_KEY];
+      if (!injector?.validateProfileData) throw new Error("环境核心不可用");
+      injector.validateProfileData(profile);
+    } catch { setStatus("环境数据无效或包含敏感内容，已拒绝导出", "error"); return; }
     let content = "";
     try {
       content = profileToml(profile);
@@ -3286,9 +3950,106 @@
     }
   }
 
+  function environmentStatusLabel() {
+    let status = null;
+    try { status = window[INJECTOR_GLOBAL_KEY]?.status?.() || null; } catch {}
+    const profiles = Array.isArray(status?.profiles) ? status.profiles : [];
+    const currentThreadId = String(status?.currentThreadId || "").trim();
+    const profileId = currentThreadId
+      ? String(status?.currentProfileId || "base")
+      : String(status?.pendingProfileId || "base");
+    const profile = profiles.find((item) => String(item?.id || "") === profileId);
+    const name = String(profile?.name || (profileId === "base" ? "Base" : profileId));
+    const prefix = !currentThreadId && status?.pendingProfileId ? "下次环境" : "当前环境";
+    if (!currentThreadId || !status?.currentProfileBinding) return `${prefix}: ${name}`;
+    const binding = status.currentProfileBinding;
+    const proof = status.currentProof;
+    const confirmed = binding.applied === true && proof?.status === "acknowledged" && proof.matchesCurrentProfile === true
+      && binding.proofId && binding.proofId === proof.proofId
+      && /^sha256:[0-9a-f]{64}$/i.test(proof.payloadDigest || "");
+    return `${prefix}: ${name} · ${confirmed ? "转发已确认" : "未确认"}`;
+  }
+
+  function replaceStatusNavText(root, label) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    const target = nodes.find((node) => {
+      const text = String(node.nodeValue || "").trim();
+      return text === "环境注入器" || /^(当前环境|下次环境|环境)\s*[:：]/.test(text);
+    });
+    if (target) target.nodeValue = label;
+    else {
+      const text = document.createElement("span");
+      text.setAttribute("data-codex-environment-status-label", "true");
+      text.textContent = label;
+      root.append(text);
+    }
+  }
+
+  function updateSidebarStatus() {
+    if (!statusNavNode?.isConnected) {
+      statusNavNode = document.querySelector(`[${STATUS_NAV_ATTR}]`);
+    }
+    if (!statusNavNode) return;
+    const label = environmentStatusLabel();
+    if (statusNavNode.getAttribute("data-environment-status-label") !== label) {
+      replaceStatusNavText(statusNavNode, label);
+      statusNavNode.setAttribute("data-environment-status-label", label);
+      statusNavNode.setAttribute("aria-label", label);
+      statusNavNode.title = `${label}；点击选择下个对话环境`;
+    }
+  }
+
+  async function openEnvironmentSelector() {
+    const injector = window[INJECTOR_GLOBAL_KEY];
+    if (!injector || typeof injector.open !== "function") {
+      openStudio();
+      return;
+    }
+    try {
+      const selected = await injector.open();
+      if (selected && typeof injector.setNext === "function") injector.setNext(selected);
+    } catch {}
+  }
+
+  function installStatusEntry() {
+    if (!navNode?.isConnected) return;
+    const existing = document.querySelector(`[${STATUS_NAV_ATTR}]`);
+    if (existing) {
+      statusNavNode = existing;
+      if (navNode.nextElementSibling !== existing) navNode.insertAdjacentElement("afterend", existing);
+      updateSidebarStatus();
+      return;
+    }
+    const clone = navNode.cloneNode(true);
+    clone.removeAttribute(NAV_ATTR);
+    clone.setAttribute(STATUS_NAV_ATTR, "true");
+    clone.removeAttribute("id");
+    clone.removeAttribute("aria-current");
+    clone.removeAttribute("data-state");
+    clone.style.opacity = "0.78";
+    if (clone instanceof HTMLAnchorElement) clone.href = "#";
+    clone.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+    replaceStatusNavText(clone, environmentStatusLabel());
+    clone.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void openEnvironmentSelector();
+    }, { signal });
+    navNode.insertAdjacentElement("afterend", clone);
+    statusNavNode = clone;
+    updateSidebarStatus();
+  }
+
   function installSidebarEntry() {
     if (destroyed) return;
-    if (document.querySelector(`[${NAV_ATTR}]`)) return;
+    const existing = document.querySelector(`[${NAV_ATTR}]`);
+    if (existing) {
+      navNode = existing;
+      installStatusEntry();
+      return;
+    }
     const reference = findSidebarReference();
     if (!reference || !reference.parentElement) return;
     const clone = reference.cloneNode(true);
@@ -3306,6 +4067,7 @@
     }, { signal });
     reference.insertAdjacentElement("afterend", clone);
     navNode = clone;
+    installStatusEntry();
   }
 
   function scheduleSidebarScan() {
@@ -3337,8 +4099,10 @@
     lifetime.abort();
     observer?.disconnect();
     window.clearTimeout(scanTimer);
+    window.clearInterval(statusTimer);
     try { uiAdapter?.destroy?.(); } catch {}
     uiAdapter = null;
+    statusNavNode?.remove();
     navNode?.remove();
     host?.remove();
     const currentApi = window[GLOBAL_KEY];
@@ -3361,6 +4125,7 @@
       selectorProfileId,
       storageKeyFor,
       environmentStore: () => cloneJson(store),
+      environmentStatusLabel,
     };
     window.__codexEnvironmentStudioTest = testApi;
     window.__codexPlusProfileStudioTest = testApi;
@@ -3369,6 +4134,7 @@
 
   createUi();
   installSidebarEntry();
+  statusTimer = window.setInterval(updateSidebarStatus, 1000);
   observer = new MutationObserver(scheduleSidebarScan);
   observer.observe(document.documentElement, { childList: true, subtree: true });
   document.addEventListener("keydown", (event) => {
@@ -3377,7 +4143,10 @@
   window.addEventListener(UPDATE_EVENT, () => {
     store = loadStore();
     renderProfileList();
+    updateSidebarStatus();
   }, { signal });
+  window.addEventListener("popstate", updateSidebarStatus, { signal });
+  window.addEventListener("hashchange", updateSidebarStatus, { signal });
 
   const publicApi = {
     version: VERSION,
@@ -3396,6 +4165,8 @@
         storedProfiles: storedProfileEntries().length,
         storeRevision: Number(store.revision || 0),
         sidebarInstalled: !!document.querySelector(`[${NAV_ATTR}]`),
+        statusSidebarInstalled: !!document.querySelector(`[${STATUS_NAV_ATTR}]`),
+        environmentStatusLabel: environmentStatusLabel(),
         open: adapterStatus ? adapterStatus.open === true : !!dialog && !dialog.hidden,
         renderer: adapterStatus ? "react" : "vanilla",
       };
@@ -4177,7 +4948,7 @@
   var require_react_dom_production = __commonJS({
     "node_modules/react-dom/cjs/react-dom.production.js"(exports) {
       "use strict";
-      var React3 = require_react();
+      var React4 = require_react();
       function formatProdErrorMessage(code) {
         var url = "https://react.dev/errors/" + code;
         if (1 < arguments.length) {
@@ -4217,7 +4988,7 @@
           implementation
         };
       }
-      var ReactSharedInternals = React3.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+      var ReactSharedInternals = React4.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
       function getCrossOriginStringAs(as, input) {
         if ("font" === as) return "";
         if ("string" === typeof input)
@@ -4353,7 +5124,7 @@
     "node_modules/react-dom/cjs/react-dom-client.production.js"(exports) {
       "use strict";
       var Scheduler = require_scheduler();
-      var React3 = require_react();
+      var React4 = require_react();
       var ReactDOM = require_react_dom();
       function formatProdErrorMessage(code) {
         var url = "https://react.dev/errors/" + code;
@@ -4548,7 +5319,7 @@
         return null;
       }
       var isArrayImpl = Array.isArray;
-      var ReactSharedInternals = React3.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
+      var ReactSharedInternals = React4.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
       var ReactDOMSharedInternals = ReactDOM.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;
       var sharedNotPendingObject = {
         pending: false,
@@ -15994,7 +16765,7 @@
           0 === i && attemptExplicitHydrationTarget(target);
         }
       };
-      var isomorphicReactPackageVersion$jscomp$inline_1840 = React3.version;
+      var isomorphicReactPackageVersion$jscomp$inline_1840 = React4.version;
       if ("19.2.8" !== isomorphicReactPackageVersion$jscomp$inline_1840)
         throw Error(
           formatProdErrorMessage(
@@ -16165,7 +16936,7 @@
   var import_client = __toESM(require_client(), 1);
 
   // src/react/App.tsx
-  var import_react2 = __toESM(require_react(), 1);
+  var import_react4 = __toESM(require_react(), 1);
 
   // src/react/Studio.tsx
   var import_react = __toESM(require_react(), 1);
@@ -16217,7 +16988,7 @@
     };
   }
   function likelySecret(text) {
-    return /\bsk-[A-Za-z0-9_-]{16,}\b|\b(?:api[_-]?key|token|password|secret|authorization|bearer|credential)\s*[:=]/i.test(text);
+    return /\bsk-[A-Za-z0-9_-]{16,}\b|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|authorization|bearer|credential)["']?\s*[:=]|\bBearer\s+[A-Za-z0-9_./+=-]{12,}|[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@/i.test(text);
   }
   function tomlString(value) {
     return JSON.stringify(String(value ?? ""));
@@ -16309,11 +17080,16 @@
       if (!/^[A-Za-z0-9_-]+$/.test(form.id)) return "环境 ID 只能包含英文、数字、下划线和减号";
       if (form.developerInstructions.length > 4e4 || form.baseInstructions.length > 4e4) return "提示词不能超过 40000 个字符";
       try {
-        JSON.parse(form.configText || "{}");
+        const config = JSON.parse(form.configText || "{}");
+        if (!config || typeof config !== "object" || Array.isArray(config)) return "Additional Config 必须是 JSON 对象";
       } catch {
         return "Additional Config JSON 格式无效";
       }
       if (![form.model, form.modelProvider, form.developerInstructions, form.baseInstructions, form.approvalPolicy, form.sandbox, form.serviceTier, form.reasoning].some(Boolean) && form.memoryUse === "inherit" && form.memoryGenerate === "inherit" && form.configText.trim() === "{}") return "请至少提供一项环境设置";
+      const key = form.targetProfileId ? `override:${form.targetProfileId}` : form.id;
+      if (Object.hasOwn(core.environmentStore.profiles, key) && key !== selectedStorageKey) return "环境 ID 已存在，不能覆盖另一环境";
+      const countAfter = Object.keys(core.environmentStore.profiles).length + (Object.hasOwn(core.environmentStore.profiles, key) ? 0 : 1) - (selectedStorageKey && selectedStorageKey !== key && Object.hasOwn(core.environmentStore.profiles, selectedStorageKey) ? 1 : 0);
+      if (countAfter > 50) return "最多保存 50 个本地环境";
       return "";
     };
     const save = () => {
@@ -16330,7 +17106,11 @@
         return;
       }
       if (form.reasoning) config.model_reasoning_effort = form.reasoning;
-      if ((likelySecret(form.developerInstructions) || likelySecret(form.baseInstructions) || likelySecret(form.configText)) && !window.confirm("环境内容可能包含密钥或认证字段，仍要保存到页面 localStorage 吗？")) return;
+      if (likelySecret(form.developerInstructions) || likelySecret(form.baseInstructions) || likelySecret(form.configText)) {
+        setKind("error");
+        setMessage("敏感字段不允许写入环境；请改用环境变量名或凭据存储");
+        return;
+      }
       const next = clone(core.environmentStore);
       const storageKey = form.targetProfileId ? `override:${form.targetProfileId}` : form.id;
       if (selectedStorageKey && selectedStorageKey !== storageKey) delete next.profiles[selectedStorageKey];
@@ -16352,11 +17132,25 @@
         createdAt: previous?.createdAt || Date.now(),
         updatedAt: Date.now()
       };
-      api2.replaceEnvironmentStore(next);
+      try {
+        api2.saveProfile(next.profiles[storageKey], { previousKey: selectedStorageKey, expectedRevision: core.environmentStore.revision });
+      } catch {
+        setKind("error");
+        setMessage("保存失败：数据无效、环境已变化或存储不可写。请重新加载检查。");
+        return;
+      }
       const environmentId = form.targetProfileId || `studio:${form.id}`;
-      if (useNext) api2.setNext(environmentId);
       setSelectedId(environmentId);
       setSelectedStorageKey(storageKey);
+      if (useNext) {
+        try {
+          api2.setNext(environmentId);
+        } catch {
+          setKind("error");
+          setMessage("环境已保存，但下次环境选择保存失败");
+          return;
+        }
+      }
       setKind("success");
       setMessage(form.targetProfileId ? `已保存 ${form.targetProfileId} 的本地覆盖。` : `已保存环境 ${form.name || form.id}。`);
     };
@@ -16366,16 +17160,35 @@
       if (!window.confirm(isOverride ? `恢复文件环境“${form.targetProfileId}”并删除本地覆盖？` : `删除环境“${form.name || form.id}”？`)) return;
       const next = clone(core.environmentStore);
       delete next.profiles[selectedStorageKey];
-      api2.replaceEnvironmentStore(next);
+      try {
+        api2.replaceEnvironmentStore(next);
+      } catch {
+        setKind("error");
+        setMessage("删除未保存：环境已变化或存储不可写");
+        return;
+      }
       createNew();
       setKind("success");
       setMessage(isOverride ? `已恢复文件环境 ${form.targetProfileId}。` : "环境已删除。");
     };
     const exportToml = () => {
+      const invalid = validate();
+      if (invalid || likelySecret(form.developerInstructions) || likelySecret(form.baseInstructions) || likelySecret(form.configText)) {
+        setKind("error");
+        setMessage(invalid || "敏感内容不允许导出");
+        return;
+      }
       let config = {};
       try {
         config = JSON.parse(form.configText || "{}");
       } catch {
+      }
+      try {
+        api2.validateProfileData({ ...form, config });
+      } catch {
+        setKind("error");
+        setMessage("配置无效或包含敏感字段，已拒绝导出");
+        return;
       }
       const blob = new Blob([profileToml(form, config)], { type: "text/plain;charset=utf-8" });
       const url = URL.createObjectURL(blob);
@@ -16505,12 +17318,179 @@
     return [profile.source === "file" ? "文件" : profile.source === "studio-override" ? "本地覆盖" : "本地", profile.model, profile.modelProvider].filter(Boolean).join(" · ");
   }
 
-  // src/react/App.tsx
+  // src/react/ProfileSwitcher.tsx
+  var import_react2 = __toESM(require_react(), 1);
   var import_jsx_runtime2 = __toESM(require_jsx_runtime(), 1);
-  function useUi(store) {
-    return (0, import_react2.useSyncExternalStore)(store.subscribe, store.getSnapshot, store.getSnapshot);
+  function CurrentProfileSwitcher({ api: api2, core }) {
+    const threadId = core.status.currentThreadId;
+    const [selected, setSelected] = (0, import_react2.useState)(core.currentProfile?.id || "base");
+    const [busy, setBusy] = (0, import_react2.useState)(false);
+    const [message, setMessage] = (0, import_react2.useState)("");
+    const current = (0, import_react2.useRef)(threadId);
+    current.current = threadId;
+    (0, import_react2.useEffect)(() => {
+      setSelected(core.currentProfile?.id || "base");
+      setBusy(false);
+      setMessage("");
+    }, [threadId]);
+    const availability = core.status.currentSwitch;
+    const apply = async () => {
+      const target = core.profiles.find((profile) => profile.id === selected);
+      if (!threadId || !target || busy || availability?.busy) return;
+      if (!window.confirm(`将本会话的热切项应用为“${target.name}”？更新 Developer、模型、推理和 Service Tier；历史及后台服务保留，初始化配置不热切。${target.modelProvider ? `Profile 指定 Provider：${target.modelProvider}；仅允许与当前相同。` : ""}`)) return;
+      setBusy(true);
+      setMessage("正在更新原生会话设置…");
+      try {
+        const result = await api2.switchThreadProfile(threadId, target.id);
+        if (current.current === threadId) setMessage(result.message);
+      } catch (error) {
+        if (current.current === threadId) setMessage(error instanceof Error ? error.message : "切换未确认，请检查会话设置");
+      } finally {
+        if (current.current === threadId) setBusy(false);
+      }
+    };
+    if (!threadId) return null;
+    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-card", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: "切换当前对话的 Profile" }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-actions", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "select",
+          {
+            className: "ei-studio-input",
+            value: selected,
+            disabled: busy || availability?.busy,
+            onChange: (event) => setSelected(event.target.value),
+            "aria-label": "当前对话目标 Profile",
+            children: core.profiles.map((profile) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("option", { value: profile.id, children: profile.name }, profile.id))
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "button",
+          {
+            className: "ei-button ei-button-primary",
+            type: "button",
+            disabled: busy || availability?.busy || !availability?.available,
+            onClick: () => void apply(),
+            children: busy || availability?.busy ? "正在切换…" : "应用到当前对话"
+          }
+        )
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "ei-help", children: "仅支持 Default 模式的空闲会话。Base 撤销本功能的附加角色规则；Provider、Base Instructions、插件和记忆初始化配置需新会话。现有权限保持不变。" }),
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "ei-status", children: message || availability?.result?.message || availability?.reason || "" })
+    ] });
   }
-  var UiErrorBoundary = class extends import_react2.Component {
+
+  // src/react/useDraftEditor.ts
+  var import_react3 = __toESM(require_react(), 1);
+  function useDraftEditor({ api: api2, store, source, persistedDraft, draftKey, previewPath, commitPath, label }) {
+    const [draft, setDraft] = (0, import_react3.useState)(String(persistedDraft ?? source.content ?? ""));
+    const [preview, setPreview] = (0, import_react3.useState)(null);
+    const [message, setMessage] = (0, import_react3.useState)("");
+    const current = (0, import_react3.useRef)({
+      generation: 0,
+      dirty: false,
+      disposed: false,
+      busy: false,
+      draft,
+      sourceHash: source.hash,
+      persistedDraft
+    });
+    Object.assign(current.current, { draft, sourceHash: source.hash, persistedDraft });
+    (0, import_react3.useEffect)(() => {
+      current.current.disposed = false;
+      return () => {
+        current.current.disposed = true;
+        current.current.generation += 1;
+      };
+    }, []);
+    (0, import_react3.useEffect)(() => {
+      current.current.generation += 1;
+      setPreview(null);
+      if (persistedDraft == null && current.current.draft === source.content) current.current.dirty = false;
+      if (!current.current.dirty) setDraft(String(persistedDraft ?? source.content ?? ""));
+    }, [source.hash, source.content, persistedDraft]);
+    const edit = (value) => {
+      current.current.dirty = true;
+      current.current.generation += 1;
+      current.current.draft = value;
+      setDraft(value);
+      setPreview(null);
+    };
+    const runPreview = async () => {
+      const state = current.current;
+      const generation = ++state.generation;
+      const content = state.draft;
+      const sourceHash = state.sourceHash;
+      setPreview(null);
+      try {
+        api2.validateDraftData(content);
+      } catch {
+        setMessage("草案包含敏感内容或超出限制");
+        return;
+      }
+      const result = await api2.bridgeCall(previewPath, {
+        content,
+        ...typeof sourceHash === "string" ? { expectedHash: sourceHash } : {}
+      });
+      if (state.disposed || generation !== state.generation || content !== state.draft || sourceHash !== state.sourceHash) return;
+      setPreview(result.status === "ok" ? {
+        ...result,
+        content,
+        sourceHash,
+        generation,
+        comparison: `--- 当前磁盘内容
+${source.content || ""}
++++ 确认后写入内容
+${content}`
+      } : null);
+      setMessage(result.status === "ok" ? "请核对以下原文和拟写入内容" : result.message || "预览失败");
+    };
+    const commit = async () => {
+      const state = current.current;
+      if (state.disposed || state.busy || !preview || preview.content !== state.draft || preview.generation !== state.generation || preview.sourceHash !== state.sourceHash) return;
+      const content = preview.content;
+      const previousDraft = state.persistedDraft;
+      const expectedHash = preview.before?.hash;
+      state.busy = true;
+      try {
+        const result = await api2.bridgeCall(commitPath, {
+          content,
+          ...typeof expectedHash === "string" ? { expectedHash } : {}
+        });
+        if (state.disposed) return;
+        setPreview(null);
+        if (result.status !== "ok") {
+          setMessage(result.status === "conflict" ? "源文件已变化，请重新预览" : result.message || "写入失败");
+          return;
+        }
+        let cleared = true;
+        if (state.draft === content) {
+          state.dirty = true;
+          if (state.persistedDraft === previousDraft) {
+            try {
+              api2.updateUiPreferences({ [draftKey]: void 0 });
+            } catch {
+              cleared = false;
+            }
+          }
+        }
+        await api2.refreshBridge();
+        if (state.disposed) return;
+        store.showToast(`${label}已写入；备份：${result.backup || "新文件"}`, "success");
+        setMessage(cleared ? "写入完成；提交期间的新编辑会保留" : "文件已写入，但本地草案清理失败");
+      } finally {
+        state.busy = false;
+      }
+    };
+    return { draft, preview, message, runPreview, commit, edit };
+  }
+
+  // src/react/App.tsx
+  var import_jsx_runtime3 = __toESM(require_jsx_runtime(), 1);
+  function useUi(store) {
+    return (0, import_react4.useSyncExternalStore)(store.subscribe, store.getSnapshot, store.getSnapshot);
+  }
+  var UiErrorBoundary = class extends import_react4.Component {
     state = { failed: false };
     static getDerivedStateFromError() {
       return { failed: true };
@@ -16521,7 +17501,7 @@ ${info.componentStack || ""}`);
     }
     render() {
       if (this.state.failed) {
-        return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-card", children: "React UI 加载失败；headless 注入核心仍在运行。重新加载 Userscript 可恢复旧版备用 UI。" });
+        return /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-card", children: "React UI 加载失败；headless 注入核心仍在运行。重新加载 Userscript 可恢复旧版备用 UI。" });
       }
       return this.props.children;
     }
@@ -16536,67 +17516,55 @@ ${info.componentStack || ""}`);
     if (profile.modelProvider) parts.push(profile.modelProvider);
     return parts.join(" · ");
   }
-  function pillLabel(snapshot) {
-    const status = snapshot.status;
-    if (status.currentThreadId && status.currentProfileId) {
-      const profile = snapshot.profiles.find((item) => item.id === status.currentProfileId);
-      return `当前环境: ${profile?.name || status.currentProfileId}`;
-    }
-    if (status.pendingProfileId) {
-      const profile = snapshot.profiles.find((item) => item.id === status.pendingProfileId);
-      return `下次环境: ${profile?.name || status.pendingProfileId}`;
-    }
-    return "环境: Base";
-  }
   function Button({ children, primary = false, ...props }) {
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: `ei-button${primary ? " ei-button-primary" : ""}`, type: "button", ...props, children });
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("button", { className: `ei-button${primary ? " ei-button-primary" : ""}`, type: "button", ...props, children });
   }
   function ScopeHeader({ scope, title, detail }) {
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "ei-scope-header", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { "data-scope": scope, children: scope }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("h3", { children: title }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { children: detail })
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("header", { className: "ei-scope-header", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { "data-scope": scope, children: scope }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("h3", { children: title }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { children: detail })
       ] })
     ] });
   }
   function MetaGrid({ rows, className = "" }) {
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: `ei-meta${className ? ` ${className}` : ""}`, children: rows.map(([label, value]) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-meta-row", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: label }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("code", { title: String(value || ""), children: String(value || "继承 / 未设置") })
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: `ei-meta${className ? ` ${className}` : ""}`, children: rows.map(([label, value]) => /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-meta-row", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { children: label }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("code", { title: String(value || ""), children: String(value || "继承 / 未设置") })
     ] }, label)) });
   }
   function Disclosure({ title, text, empty = "未设置", defaultOpen = false, children, meta }) {
-    const [open, setOpen] = (0, import_react2.useState)(defaultOpen);
+    const [open, setOpen] = (0, import_react4.useState)(defaultOpen);
     const lines = text ? Math.max(1, text.split("\n").length) : 0;
     const resolvedMeta = meta || (children ? "查看" : lines ? `${lines} 行` : "未设置");
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-disclosure", "data-open": open, children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { className: "ei-disclosure-trigger", type: "button", "aria-expanded": open, onClick: () => setOpen((value) => !value), children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: title }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { className: "ei-disclosure-end", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "ei-disclosure-meta", children: resolvedMeta }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "ei-chevron", "aria-hidden": true, children: "⌄" })
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("section", { className: "ei-disclosure", "data-open": open, children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("button", { className: "ei-disclosure-trigger", type: "button", "aria-expanded": open, onClick: () => setOpen((value) => !value), children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { children: title }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("span", { className: "ei-disclosure-end", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "ei-disclosure-meta", children: resolvedMeta }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "ei-chevron", "aria-hidden": true, children: "⌄" })
         ] })
       ] }),
-      open ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-disclosure-body", children: children ?? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("pre", { className: "ei-pre", "data-empty": !text, children: text || empty }) }) : null
+      open ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-disclosure-body", children: children ?? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("pre", { className: "ei-pre", "data-empty": !text, children: text || empty }) }) : null
     ] });
   }
   function SelectEnvironmentView({ store, core, title }) {
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(ScopeHeader, { scope: "会话级", title: title === "选择环境" ? "下个对话" : title, detail: "选择只应用到即将创建的会话，不修改全局配置。" }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-profile-list", children: core.profiles.map((profile) => {
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)(import_jsx_runtime3.Fragment, { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(ScopeHeader, { scope: "会话级", title: title === "选择环境" ? "下个对话" : title, detail: "选择只应用到即将创建的会话，不修改全局配置。" }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-profile-list", children: core.profiles.map((profile) => {
         const selected = core.status.pendingProfileId === profile.id;
-        return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { className: "ei-profile", "data-profile-id": profile.id, "data-selected": selected, "aria-pressed": selected, type: "button", onClick: () => store.selectProfile(profile.id), children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("span", { className: "ei-profile-copy", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: profile.name }),
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("small", { children: profileDetail2(profile) })
+        return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("button", { className: "ei-profile", "data-profile-id": profile.id, "data-selected": selected, "aria-pressed": selected, type: "button", onClick: () => store.selectProfile(profile.id), children: [
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("span", { className: "ei-profile-copy", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("strong", { children: profile.name }),
+            /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("small", { children: profileDetail2(profile) })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "ei-check", children: selected ? "✓" : "" })
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "ei-check", children: selected ? "✓" : "" })
         ] }, profile.id);
       }) }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("label", { className: "ei-scope-toggle", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("input", { type: "checkbox", checked: core.status.promptOnNewThread !== false, onChange: (event) => store.setPromptOnNewThread(event.target.checked) }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: "每次新对话都询问" })
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("label", { className: "ei-scope-toggle", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("input", { type: "checkbox", checked: core.status.promptOnNewThread !== false, onChange: (event) => store.setPromptOnNewThread(event.target.checked) }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { children: "每次新对话都询问" })
       ] })
     ] });
   }
@@ -16605,23 +17573,26 @@ ${info.componentStack || ""}`);
     if (!status.currentThreadId) return { kind: "draft", label: "新对话草稿", detail: "尚未创建 thread；选择环境后发送第一条消息即可验证。" };
     const binding = status.currentProfileBinding;
     if (!binding) return { kind: "base", label: "未由选择器管理", detail: "该会话没有环境绑定记录，按 Base / Codex 全局配置运行。" };
-    if (binding.applied === true) return { kind: "confirmed", label: "已确认注入", detail: "环境已通过真实 app-server 生命周期通道确认。" };
+    const proof = status.currentProof;
+    if (binding.applied === true && proof?.status === "acknowledged" && proof.matchesCurrentProfile === true && binding.proofId && binding.proofId === proof.proofId && /^sha256:[0-9a-f]{64}$/i.test(proof.payloadDigest || ""))
+      return { kind: "confirmed", label: "请求转发已确认", detail: "环境参数已转发并关联到该会话；最终模型行为仍需独立测试。" };
+    if (binding.applied === true) return { kind: "unconfirmed", label: "当前版本未确认", detail: "证明缺失、正在校验或对应旧版环境；编辑后的内容尚未确认转发。" };
     if (binding.applied === false) return { kind: "unconfirmed", label: "已选择 · 未确认", detail: "已观察到会话，但尚无 acknowledged proof。" };
     return { kind: "unknown", label: "旧版绑定", detail: "历史记录没有保存明确注入状态。" };
   }
   function InspectorTabs({ items }) {
     const initial = items.find((item) => item.text)?.id || items[0]?.id || "";
-    const [active, setActive] = (0, import_react2.useState)(initial);
+    const [active, setActive] = (0, import_react4.useState)(initial);
     const selected = items.find((item) => item.id === active) || items[0];
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-inspector", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-inspector-tabs", children: items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("button", { type: "button", "aria-selected": selected?.id === item.id, onClick: () => setActive(item.id), children: [
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("section", { className: "ei-inspector", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-inspector-tabs", children: items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("button", { type: "button", "aria-selected": selected?.id === item.id, onClick: () => setActive(item.id), children: [
         item.label,
-        item.text ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: Math.max(1, item.text.split("\n").length) }) : null
+        item.text ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { children: Math.max(1, item.text.split("\n").length) }) : null
       ] }, item.id)) }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("pre", { className: "ei-pre", "data-empty": !selected?.text, children: selected?.text || selected?.empty || "未设置" })
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("pre", { className: "ei-pre", "data-empty": !selected?.text, children: selected?.text || selected?.empty || "未设置" })
     ] });
   }
-  function CurrentSessionView({ core }) {
+  function CurrentSessionView({ core, api: api2 }) {
     const profile = core.currentProfile || core.profiles[0];
     const status = bindingStatus(core);
     const proof = core.status.currentProof;
@@ -16629,18 +17600,19 @@ ${info.componentStack || ""}`);
     const runtimeSummary = [profile?.model, profile?.modelProvider, reasoning, profile?.sandbox].filter(Boolean).join(" · ") || "使用 Codex 全局配置";
     const configText = profile?.config && Object.keys(profile.config).length ? JSON.stringify(profile.config, null, 2) : "";
     const proofText = proof ? JSON.stringify(proof, null, 2) : "";
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(ScopeHeader, { scope: "会话级", title: "当前对话", detail: "展示这个 thread 已应用的环境、运行策略和注入证明。" }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-current-summary", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-current-title", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "ei-status-dot", "data-kind": status.kind }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: profile?.name || "Base" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "ei-current-status", children: status.label })
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)(import_jsx_runtime3.Fragment, { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(ScopeHeader, { scope: "会话级", title: "当前对话", detail: "展示环境计划、当前热切状态和注入证明。" }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(CurrentProfileSwitcher, { api: api2, core }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("section", { className: "ei-current-summary", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-current-title", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "ei-status-dot", "data-kind": status.kind }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("strong", { children: profile?.name || "Base" }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "ei-current-status", children: status.label })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { children: runtimeSummary }),
-        core.status.currentThreadId ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("code", { className: "ei-thread", children: core.status.currentThreadId }) : /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "ei-help", children: status.detail })
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { children: runtimeSummary }),
+        core.status.currentThreadId ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("code", { className: "ei-thread", children: core.status.currentThreadId }) : /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "ei-help", children: status.detail })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Disclosure, { title: "运行详情", meta: "策略与证明", children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(MetaGrid, { className: "ei-meta-flat", rows: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Disclosure, { title: "运行详情", meta: "策略与证明", children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(MetaGrid, { className: "ei-meta-flat", rows: [
         ["环境 ID", profile?.id || "base"],
         ["审批", profile?.approvalPolicy || "继承"],
         ["Service tier", profile?.serviceTier || "继承"],
@@ -16648,139 +17620,93 @@ ${info.componentStack || ""}`);
         ["Proof", proof?.status || "未绑定"],
         ["Transport", proof?.transport || core.status.currentProfileBinding?.source || "Base"]
       ] }) }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(InspectorTabs, { items: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(InspectorTabs, { items: [
         { id: "developer", label: "Developer", text: profile?.developerInstructions || "", empty: "未设置 Developer Instructions" },
         { id: "base", label: "Base", text: profile?.baseInstructions || "", empty: "未设置 Base Instructions" },
         { id: "config", label: "Config", text: configText, empty: "空配置" },
         { id: "proof", label: "Proof", text: proofText, empty: "当前会话没有注入证明" }
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "ei-note", children: "仅展示环境计划与确认记录；Codex 最终合成提示词属于内部运行态。" })
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { className: "ei-note", children: "仅展示环境计划与确认记录；Codex 最终合成提示词属于内部运行态。" })
     ] });
   }
   function MemoryView({ api: api2, store, core }) {
     const memory = core.bridgeMemory || core.environmentSnapshot.memory || {};
     const settings = core.environmentSnapshot.memory?.settings || {};
-    const correction = memory.correction || {};
-    const persistedDraft = core.environmentStore.ui.memoryCorrectionDraft;
-    const [draft, setDraft] = (0, import_react2.useState)(String(persistedDraft ?? correction.content ?? ""));
-    const [preview, setPreview] = (0, import_react2.useState)(null);
-    const [message, setMessage] = (0, import_react2.useState)("");
+    const source = memory.correction || {};
     const writable = core.status.capabilities?.diskWrite === true;
-    (0, import_react2.useEffect)(() => setDraft(String(core.environmentStore.ui.memoryCorrectionDraft ?? correction.content ?? "")), [correction.hash, core.environmentStore.revision]);
-    const runPreview = async () => {
-      const result = await api2.bridgeCall("/environment-injector/memory/preview-correction", {
-        content: draft,
-        ...typeof correction.hash === "string" ? { expectedHash: correction.hash } : {}
-      });
-      setPreview(result.status === "ok" ? result : null);
-      setMessage(result.status === "ok" ? `预览完成：+${result.diff?.addedLines || 0} / -${result.diff?.removedLines || 0} 行` : result.message || "预览失败");
-    };
-    const commit = async () => {
-      if (!preview) return;
-      const expectedHash = preview.before?.hash;
-      const result = await api2.bridgeCall("/environment-injector/memory/commit-correction", {
-        content: draft,
-        ...typeof expectedHash === "string" ? { expectedHash } : {}
-      });
-      if (result.status !== "ok") {
-        setPreview(null);
-        setMessage(result.status === "conflict" ? "源文件已变化，请重新预览。" : result.message || "写入失败");
-        return;
-      }
-      api2.updateUiPreferences({ memoryCorrectionDraft: void 0 });
-      await api2.refreshBridge();
-      store.showToast(`Memory 修正 Note 已写入；备份：${result.backup || "新文件"}`, "success");
-      setPreview(null);
-      setMessage("写入完成");
-    };
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(ScopeHeader, { scope: "全局", title: "Memories", detail: "全局记忆存储；单个环境可覆盖是否读取或生成。" }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(MetaGrid, { rows: [
-        ["总开关", settings.enabled === true ? "开启" : "关闭"],
+    const { draft, preview, message, runPreview, commit, edit } = useDraftEditor({
+      api: api2,
+      store,
+      source,
+      persistedDraft: core.environmentStore.ui.memoryCorrectionDraft,
+      draftKey: "memoryCorrectionDraft",
+      previewPath: "/environment-injector/memory/preview-correction",
+      commitPath: "/environment-injector/memory/commit-correction",
+      label: "Memory 修正 Note"
+    });
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)(import_jsx_runtime3.Fragment, { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(ScopeHeader, { scope: "全局", title: "Memories", detail: "全局记忆存储；单个环境可覆盖是否读取或生成。" }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(MetaGrid, { rows: [
+        ["总开关", settings.enabled === true ? "开启" : settings.enabled === false ? "关闭" : "未知 / 未读取"],
         ["读取记忆", String(settings.use_memories ?? "继承")],
         ["生成记忆", String(settings.generate_memories ?? "继承")],
         ["写入能力", writable ? "Bridge 可写" : "只读 / 草案"],
         ["文件", Array.isArray(memory.files) ? `${memory.files.length} 个` : "未知"]
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Disclosure, { title: "Memory Summary", text: memory.summary?.content, defaultOpen: true }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Disclosure, { title: "Durable MEMORY.md", text: memory.durable?.content }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-card", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: "记忆修正草案" }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "ei-help", children: "只写稳定事实和纠正项；不会直接改写生成的 MEMORY.md。" }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("textarea", { className: "ei-textarea", value: draft, onChange: (event) => {
-          setDraft(event.target.value);
-          setPreview(null);
-        } }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-actions", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { onClick: () => {
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Disclosure, { title: "Memory Summary", text: memory.summary?.content, defaultOpen: true }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Disclosure, { title: "Durable MEMORY.md", text: memory.durable?.content }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("section", { className: "ei-card", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("strong", { children: "记忆修正草案" }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { className: "ei-help", children: "只写稳定事实和纠正项；不会直接改写生成的 MEMORY.md。" }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("textarea", { className: "ei-textarea", value: draft, onChange: (event) => edit(event.target.value) }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-actions", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { onClick: () => {
             api2.updateUiPreferences({ memoryCorrectionDraft: draft });
             store.showToast("草案已保存");
           }, children: "保存草案" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { disabled: !writable, onClick: () => void runPreview(), children: "预览写入" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { primary: true, disabled: !preview, onClick: () => void commit(), children: "确认写入" })
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { disabled: !writable, onClick: () => void runPreview(), children: "预览写入" }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { primary: true, disabled: !preview, onClick: () => void commit(), children: "确认写入" })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "ei-status", "data-kind": preview ? "success" : message ? "error" : void 0, children: message })
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Disclosure, { title: "写入内容对比", text: preview?.comparison, defaultOpen: true }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { className: "ei-status", "data-kind": preview ? "success" : void 0, children: message })
       ] })
     ] });
   }
   function AgentsView({ api: api2, store, core }) {
     const agents = core.bridgeAgents || core.environmentSnapshot.globalAgents || {};
-    const persistedDraft = core.environmentStore.ui.agentsDraft;
-    const [draft, setDraft] = (0, import_react2.useState)(String(persistedDraft ?? agents.content ?? ""));
-    const [preview, setPreview] = (0, import_react2.useState)(null);
-    const [message, setMessage] = (0, import_react2.useState)("");
     const writable = core.status.capabilities?.diskWrite === true;
-    (0, import_react2.useEffect)(() => setDraft(String(core.environmentStore.ui.agentsDraft ?? agents.content ?? "")), [agents.hash, core.environmentStore.revision]);
-    const runPreview = async () => {
-      const result = await api2.bridgeCall("/environment-injector/agents/preview", {
-        content: draft,
-        ...typeof agents.hash === "string" ? { expectedHash: agents.hash } : {}
-      });
-      setPreview(result.status === "ok" ? result : null);
-      setMessage(result.status === "ok" ? `预览完成：+${result.diff?.addedLines || 0} / -${result.diff?.removedLines || 0} 行` : result.message || "预览失败");
-    };
-    const commit = async () => {
-      if (!preview) return;
-      const expectedHash = preview.before?.hash;
-      const result = await api2.bridgeCall("/environment-injector/agents/commit", {
-        content: draft,
-        ...typeof expectedHash === "string" ? { expectedHash } : {}
-      });
-      if (result.status !== "ok") {
-        setPreview(null);
-        setMessage(result.status === "conflict" ? "AGENTS.md 已变化，请重新预览。" : result.message || "写入失败");
-        return;
-      }
-      api2.updateUiPreferences({ agentsDraft: void 0 });
-      await api2.refreshBridge();
-      store.showToast(`AGENTS.md 已写入；备份：${result.backup || "新文件"}`, "success");
-      setPreview(null);
-      setMessage("写入完成");
-    };
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(ScopeHeader, { scope: "全局", title: "AGENTS.md", detail: "所有项目共享的稳定规则；项目目录中的 AGENTS.md 优先级更高。" }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(MetaGrid, { rows: [
+    const { draft, preview, message, runPreview, commit, edit } = useDraftEditor({
+      api: api2,
+      store,
+      source: agents,
+      persistedDraft: core.environmentStore.ui.agentsDraft,
+      draftKey: "agentsDraft",
+      previewPath: "/environment-injector/agents/preview",
+      commitPath: "/environment-injector/agents/commit",
+      label: "AGENTS.md"
+    });
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)(import_jsx_runtime3.Fragment, { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(ScopeHeader, { scope: "全局", title: "AGENTS.md", detail: "所有项目共享的稳定规则；项目目录中的 AGENTS.md 优先级更高。" }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(MetaGrid, { rows: [
         ["状态", agents.exists ? "已存在" : "未创建"],
         ["大小", Number.isFinite(agents.size) ? `${agents.size} bytes` : "—"],
         ["Hash", agents.hash || "—"],
         ["写入能力", writable ? "Bridge 可写" : "草案 / 导出"]
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-card", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("strong", { children: "AGENTS.md 草案" }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("textarea", { className: "ei-textarea ei-textarea-tall", value: draft, onChange: (event) => {
-          setDraft(event.target.value);
-          setPreview(null);
-        } }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-actions", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { onClick: () => {
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("section", { className: "ei-card", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("strong", { children: "AGENTS.md 草案" }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("textarea", { className: "ei-textarea ei-textarea-tall", value: draft, onChange: (event) => edit(event.target.value) }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-actions", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { onClick: () => {
             api2.updateUiPreferences({ agentsDraft: draft });
             store.showToast("AGENTS.md 草案已保存");
           }, children: "保存草案" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { onClick: () => navigator.clipboard.writeText(draft).then(() => store.showToast("已复制")), children: "复制" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { disabled: !writable, onClick: () => void runPreview(), children: "预览写入" }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { primary: true, disabled: !preview, onClick: () => void commit(), children: "确认写入" })
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { onClick: () => navigator.clipboard.writeText(draft).then(() => store.showToast("已复制")), children: "复制" }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { disabled: !writable, onClick: () => void runPreview(), children: "预览写入" }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { primary: true, disabled: !preview, onClick: () => void commit(), children: "确认写入" })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "ei-status", "data-kind": preview ? "success" : message ? "error" : void 0, children: message })
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Disclosure, { title: "写入内容对比", text: preview?.comparison, defaultOpen: true }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { className: "ei-status", "data-kind": preview ? "success" : void 0, children: message })
       ] })
     ] });
   }
@@ -16798,19 +17724,19 @@ ${info.componentStack || ""}`);
       ["3", "发送消息", "核心拦截 prewarm/thread/start。"],
       ["4", "检查 proof", "确认 applied=true 与 acknowledged。"]
     ];
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)(import_jsx_runtime2.Fragment, { children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(ScopeHeader, { scope: "帮助", title: "使用教程", detail: "了解会话环境、全局数据、注入证明和安全恢复。" }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-steps", children: steps.map(([number, title, detail]) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("article", { className: "ei-step", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { className: "ei-step-number", children: number }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("h4", { children: title }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { children: detail })
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)(import_jsx_runtime3.Fragment, { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(ScopeHeader, { scope: "帮助", title: "使用教程", detail: "了解会话环境、全局数据、注入证明和安全恢复。" }),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-steps", children: steps.map(([number, title, detail]) => /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("article", { className: "ei-step", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { className: "ei-step-number", children: number }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("h4", { children: title }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { children: detail })
         ] })
       ] }, number)) }),
-      tutorialSections.map(([title, paragraphs], index) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Disclosure, { title, defaultOpen: index === 0, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-tutorial-copy", children: paragraphs.map((paragraph) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { children: paragraph }, paragraph)) }) }, title)),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-actions", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { primary: true, onClick: () => store.openStudio(), children: "打开环境编辑器" }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(Button, { onClick: () => store.openMode("current"), children: "查看当前会话" })
+      tutorialSections.map(([title, paragraphs], index) => /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Disclosure, { title, defaultOpen: index === 0, children: /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-tutorial-copy", children: paragraphs.map((paragraph) => /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { children: paragraph }, paragraph)) }) }, title)),
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-actions", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { primary: true, onClick: () => store.openStudio(), children: "打开环境编辑器" }),
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(Button, { onClick: () => store.openMode("current"), children: "查看当前会话" })
       ] })
     ] });
   }
@@ -16820,15 +17746,15 @@ ${info.componentStack || ""}`);
     { label: "帮助", items: [{ mode: "tutorial", label: "使用教程" }] }
   ];
   function ScopeNavigation({ mode, store }) {
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("aside", { className: "ei-scope-nav", "aria-label": "环境注入器导航", children: navigationGroups.map((group) => /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-scope-nav-group", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("span", { children: group.label }),
-      group.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { type: "button", "aria-current": item.mode === mode ? "page" : void 0, onClick: () => item.action === "studio" ? store.openStudio() : item.mode && store.openMode(item.mode), children: item.label }, item.label))
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("aside", { className: "ei-scope-nav", "aria-label": "环境注入器导航", children: navigationGroups.map((group) => /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("section", { className: "ei-scope-nav-group", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("span", { children: group.label }),
+      group.items.map((item) => /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("button", { type: "button", "aria-current": item.mode === mode ? "page" : void 0, onClick: () => item.action === "studio" ? store.openStudio() : item.mode && store.openMode(item.mode), children: item.label }, item.label))
     ] }, group.label)) });
   }
   function InjectorApp({ api: api2, store }) {
     const state = useUi(store);
     const expanded = state.core.environmentStore.ui.panelExpanded === true;
-    (0, import_react2.useEffect)(() => {
+    (0, import_react4.useEffect)(() => {
       const onKey = (event) => {
         if (event.key !== "Escape") return;
         if (state.studioOpen) store.closeStudio();
@@ -16837,36 +17763,35 @@ ${info.componentStack || ""}`);
       document.addEventListener("keydown", onKey);
       return () => document.removeEventListener("keydown", onKey);
     }, [state.open, state.studioOpen, store]);
-    return /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(UiErrorBoundary, { onError: (message) => store.showToast(message, "error"), children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-shell", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ei-pill", type: "button", onClick: () => store.openFromPill(), children: pillLabel(state.core) }),
-      state.open ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-backdrop", onMouseDown: (event) => {
+    return /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(UiErrorBoundary, { onError: (message) => store.showToast(message, "error"), children: /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-shell", children: [
+      state.open ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-backdrop", onMouseDown: (event) => {
         if (event.target === event.currentTarget) store.close();
-      }, children: /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("section", { className: "ei-dialog", "data-mode": state.mode, "data-expanded": expanded, role: "dialog", "aria-modal": "true", "aria-label": "环境注入器", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("header", { className: "ei-header ei-main-header", onDoubleClick: (event) => {
+      }, children: /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("section", { className: "ei-dialog", "data-mode": state.mode, "data-expanded": expanded, role: "dialog", "aria-modal": "true", "aria-label": "环境注入器", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("header", { className: "ei-header ei-main-header", onDoubleClick: (event) => {
           if (!event.target.closest("button")) store.setExpanded(!expanded);
         }, children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-header-copy", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("h2", { children: "环境注入器" }),
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { children: "会话环境与全局上下文" })
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-header-copy", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("h2", { children: "环境注入器" }),
+            /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("p", { children: "会话环境与全局上下文" })
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-header-actions", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ei-icon-button", type: "button", title: expanded ? "恢复面板大小" : "最大化面板", "aria-label": expanded ? "恢复面板大小" : "最大化面板", onClick: () => store.setExpanded(!expanded), children: expanded ? "↙" : "↗" }),
-            /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { className: "ei-icon-button", type: "button", "aria-label": "关闭", onClick: () => store.close(), children: "×" })
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-header-actions", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("button", { className: "ei-icon-button", type: "button", title: expanded ? "恢复面板大小" : "最大化面板", "aria-label": expanded ? "恢复面板大小" : "最大化面板", onClick: () => store.setExpanded(!expanded), children: expanded ? "↙" : "↗" }),
+            /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("button", { className: "ei-icon-button", type: "button", "aria-label": "关闭", onClick: () => store.close(), children: "×" })
           ] })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("div", { className: "ei-main-layout", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(ScopeNavigation, { mode: state.mode, store }),
-          /* @__PURE__ */ (0, import_jsx_runtime2.jsxs)("main", { className: `ei-body${state.mode === "current" ? " ei-body-current" : ""}`, children: [
-            state.mode === "select" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(SelectEnvironmentView, { store, core: state.core, title: state.title }) : null,
-            state.mode === "current" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(CurrentSessionView, { core: state.core }) : null,
-            state.mode === "memory" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(MemoryView, { api: api2, store, core: state.core }) : null,
-            state.mode === "agents" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(AgentsView, { api: api2, store, core: state.core }) : null,
-            state.mode === "tutorial" ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(TutorialView, { store }) : null
+        /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("div", { className: "ei-main-layout", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(ScopeNavigation, { mode: state.mode, store }),
+          /* @__PURE__ */ (0, import_jsx_runtime3.jsxs)("main", { className: `ei-body${state.mode === "current" ? " ei-body-current" : ""}`, children: [
+            state.mode === "select" ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(SelectEnvironmentView, { store, core: state.core, title: state.title }) : null,
+            state.mode === "current" ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(CurrentSessionView, { core: state.core, api: api2 }) : null,
+            state.mode === "memory" ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(MemoryView, { api: api2, store, core: state.core }) : null,
+            state.mode === "agents" ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(AgentsView, { api: api2, store, core: state.core }) : null,
+            state.mode === "tutorial" ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(TutorialView, { store }) : null
           ] })
         ] })
       ] }) }) : null,
-      state.studioOpen ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(StudioDialog, { api: api2, store, core: state.core }) : null,
-      state.toast ? /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("div", { className: "ei-toast", "data-kind": state.toast.kind, children: state.toast.message }, state.toast.nonce) : null
+      state.studioOpen ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)(StudioDialog, { api: api2, store, core: state.core }) : null,
+      state.toast ? /* @__PURE__ */ (0, import_jsx_runtime3.jsx)("div", { className: "ei-toast", "data-kind": state.toast.kind, children: state.toast.message }, state.toast.nonce) : null
     ] }) });
   }
 
@@ -17003,8 +17928,6 @@ ${info.componentStack || ""}`);
 * { box-sizing: border-box; }
 button, input, select, textarea { font: inherit; }
 .ei-shell { position: fixed; inset: 0; z-index: 2147483200; pointer-events: none; color: var(--color-text, CanvasText); font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-.ei-pill { position: fixed; right: 16px; bottom: 16px; pointer-events: auto; appearance: none; border: 1px solid color-mix(in srgb, CanvasText 16%, transparent); border-radius: 999px; padding: 8px 12px; background: color-mix(in srgb, var(--color-surface, Canvas) 94%, transparent); color: inherit; box-shadow: 0 6px 24px rgba(0,0,0,.2); cursor: pointer; backdrop-filter: blur(14px); font-size: 12px; font-weight: 650; }
-.ei-pill:hover { border-color: color-mix(in srgb, var(--color-token-primary, #3b82f6) 58%, transparent); transform: translateY(-1px); }
 .ei-backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; pointer-events: auto; background: rgba(0,0,0,.44); backdrop-filter: blur(3px); animation: ei-fade .15s ease-out; }
 .ei-dialog { width: min(440px, calc(100vw - 24px)); max-height: min(760px, calc(100vh - 32px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 14%, transparent); border-radius:14px; background:color-mix(in srgb,var(--color-surface,Canvas) 98%,transparent); color:inherit; box-shadow:0 16px 48px rgba(0,0,0,.3); animation: ei-dialog .17s cubic-bezier(.2,.8,.2,1); transition: width .18s ease,height .18s ease,border-radius .18s ease; }
 .ei-dialog[data-mode="select"] { width:min(700px,calc(100vw - 24px)); }
@@ -17151,8 +18074,8 @@ button, input, select, textarea { font: inherit; }
 `;
 
   // src/react/index.tsx
-  var import_jsx_runtime3 = __toESM(require_jsx_runtime(), 1);
-  var REACT_UI_VERSION = "0.3.2";
+  var import_jsx_runtime4 = __toESM(require_jsx_runtime(), 1);
+  var REACT_UI_VERSION = "0.4.0";
   var HOST_ID = "codexpp-environment-react-host";
   window.__codexEnvironmentReactUi?.destroy?.();
   var api = window.__codexEnvironmentInjector;
@@ -17197,7 +18120,7 @@ button, input, select, textarea { font: inherit; }
       }
     };
     store.setDestroyCallback(cleanup);
-    root.render(/* @__PURE__ */ (0, import_jsx_runtime3.jsx)(InjectorApp, { api, store }));
+    root.render(/* @__PURE__ */ (0, import_jsx_runtime4.jsx)(InjectorApp, { api, store }));
     detach = api.attachUiAdapter(store);
     detachStudio = window.__codexEnvironmentStudio?.attachUiAdapter?.({
       open: () => store.openStudio(),

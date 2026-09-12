@@ -16,7 +16,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 STATE_SCHEMA_VERSION = 1
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_@-]+$")

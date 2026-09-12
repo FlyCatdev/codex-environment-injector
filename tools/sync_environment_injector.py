@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 SCRIPT_NAME = "codex-environment-injector.js"
 SCRIPT_KEY = f"user:{SCRIPT_NAME}"
 LEGACY_SCRIPT_KEYS = (
@@ -59,13 +59,15 @@ EXPLICIT_KEYS = {
 MAX_PROFILE_JSON_BYTES = 128 * 1024
 MAX_DEVELOPER_INSTRUCTIONS_CHARS = 40_000
 MAX_EMBEDDED_TEXT_CHARS = 128 * 1024
+URL_CREDENTIAL_RE = re.compile(r"[a-z][a-z0-9+.-]*://[^/\s@]+:[^/\s@]+@", re.IGNORECASE)
 TEXT_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9_./+\-=]{12,}", re.IGNORECASE),
     re.compile(
-        r"((?:api[_-]?key|token|password|secret|authorization|credential)\s*[:=]\s*)[^\s,;]+",
+        r"""((?:api[_-]?key|token|password|secret|authorization|credential)["']?\s*[:=]\s*["']?)[^"'\s,;}]+""",
         re.IGNORECASE,
     ),
+    URL_CREDENTIAL_RE,
 )
 
 
@@ -125,6 +127,10 @@ def sanitize_value(
         return result
     if isinstance(value, list):
         return [sanitize_value(item, path, removed) for item in value]
+    if isinstance(value, str):
+        if URL_CREDENTIAL_RE.search(value):
+            raise SyncError("credential-bearing URLs are not allowed in profiles; use environment variable references")
+        return redact_embedded_text(value, ".".join(path), removed)
     return json_safe(value, path)
 
 
@@ -333,6 +339,7 @@ def render_userscript(
     warnings: list[str],
     environment_snapshot: dict[str, Any] | None = None,
     react_ui_text: str = "",
+    generated_at_value: str | None = None,
 ) -> str:
     token = "__CODEX_ENVIRONMENT_BUNDLE__"
     if template_text.count(token) != 1:
@@ -340,7 +347,7 @@ def render_userscript(
     bundle = {
         "schemaVersion": 2,
         "generatorVersion": VERSION,
-        "generatedAt": generated_at(),
+        "generatedAt": generated_at() if generated_at_value is None else generated_at_value,
         "profiles": profiles,
         "warnings": warnings,
         "environment": environment_snapshot or {},

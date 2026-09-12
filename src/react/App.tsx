@@ -3,6 +3,8 @@ import type { ErrorInfo, PropsWithChildren, ReactNode } from 'react'
 import type { CoreApi, EnvironmentProfile, PanelMode, UiSnapshot } from './types'
 import { ReactUiStore } from './store'
 import { StudioDialog } from './Studio'
+import { CurrentProfileSwitcher } from './ProfileSwitcher'
+import { useDraftEditor } from './useDraftEditor'
 
 function useUi(store: ReactUiStore) {
   return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot)
@@ -36,19 +38,6 @@ function profileDetail(profile: EnvironmentProfile) {
   if (profile.model) parts.push(profile.model)
   if (profile.modelProvider) parts.push(profile.modelProvider)
   return parts.join(' · ')
-}
-
-function pillLabel(snapshot: UiSnapshot) {
-  const status = snapshot.status
-  if (status.currentThreadId && status.currentProfileId) {
-    const profile = snapshot.profiles.find((item) => item.id === status.currentProfileId)
-    return `当前环境: ${profile?.name || status.currentProfileId}`
-  }
-  if (status.pendingProfileId) {
-    const profile = snapshot.profiles.find((item) => item.id === status.pendingProfileId)
-    return `下次环境: ${profile?.name || status.pendingProfileId}`
-  }
-  return '环境: Base'
 }
 
 function Button({ children, primary = false, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { primary?: boolean }) {
@@ -102,15 +91,19 @@ function SelectEnvironmentView({ store, core, title }: { store: ReactUiStore; co
 }
 
 function bindingStatus(core: UiSnapshot) {
-  const status = core.status
-  if (!status.currentThreadId) return { kind: 'draft', label: '新对话草稿', detail: '尚未创建 thread；选择环境后发送第一条消息即可验证。' }
-  const binding = status.currentProfileBinding
-  if (!binding) return { kind: 'base', label: '未由选择器管理', detail: '该会话没有环境绑定记录，按 Base / Codex 全局配置运行。' }
-  if (binding.applied === true) return { kind: 'confirmed', label: '已确认注入', detail: '环境已通过真实 app-server 生命周期通道确认。' }
-  if (binding.applied === false) return { kind: 'unconfirmed', label: '已选择 · 未确认', detail: '已观察到会话，但尚无 acknowledged proof。' }
-  return { kind: 'unknown', label: '旧版绑定', detail: '历史记录没有保存明确注入状态。' }
-}
-
+    const status = core.status;
+    if (!status.currentThreadId) return { kind: "draft", label: "新对话草稿", detail: "尚未创建 thread；选择环境后发送第一条消息即可验证。" };
+    const binding = status.currentProfileBinding;
+    if (!binding) return { kind: "base", label: "未由选择器管理", detail: "该会话没有环境绑定记录，按 Base / Codex 全局配置运行。" };
+    const proof = status.currentProof;
+    if (binding.applied === true && proof?.status === "acknowledged" && proof.matchesCurrentProfile === true
+        && binding.proofId && binding.proofId === proof.proofId
+        && /^sha256:[0-9a-f]{64}$/i.test(proof.payloadDigest || ""))
+      return { kind: "confirmed", label: "请求转发已确认", detail: "环境参数已转发并关联到该会话；最终模型行为仍需独立测试。" };
+    if (binding.applied === true) return { kind: "unconfirmed", label: "当前版本未确认", detail: "证明缺失、正在校验或对应旧版环境；编辑后的内容尚未确认转发。" };
+    if (binding.applied === false) return { kind: "unconfirmed", label: "已选择 · 未确认", detail: "已观察到会话，但尚无 acknowledged proof。" };
+    return { kind: "unknown", label: "旧版绑定", detail: "历史记录没有保存明确注入状态。" };
+  }
 function InspectorTabs({ items }: { items: Array<{ id: string; label: string; text: string; empty: string }> }) {
   const initial = items.find((item) => item.text)?.id || items[0]?.id || ''
   const [active, setActive] = useState(initial)
@@ -121,7 +114,7 @@ function InspectorTabs({ items }: { items: Array<{ id: string; label: string; te
   </section>
 }
 
-function CurrentSessionView({ core }: { core: UiSnapshot }) {
+function CurrentSessionView({ core, api }: { core: UiSnapshot; api: CoreApi }) {
   const profile = core.currentProfile || core.profiles[0]
   const status = bindingStatus(core)
   const proof = core.status.currentProof
@@ -130,7 +123,8 @@ function CurrentSessionView({ core }: { core: UiSnapshot }) {
   const configText = profile?.config && Object.keys(profile.config).length ? JSON.stringify(profile.config, null, 2) : ''
   const proofText = proof ? JSON.stringify(proof, null, 2) : ''
   return <>
-    <ScopeHeader scope="会话级" title="当前对话" detail="展示这个 thread 已应用的环境、运行策略和注入证明。" />
+    <ScopeHeader scope="会话级" title="当前对话" detail="展示环境计划、当前热切状态和注入证明。" />
+    <CurrentProfileSwitcher api={api} core={core} />
     <section className="ei-current-summary">
       <div className="ei-current-title"><span className="ei-status-dot" data-kind={status.kind} /><strong>{profile?.name || 'Base'}</strong><span className="ei-current-status">{status.label}</span></div>
       <p>{runtimeSummary}</p>
@@ -156,47 +150,17 @@ function CurrentSessionView({ core }: { core: UiSnapshot }) {
 function MemoryView({ api, store, core }: { api: CoreApi; store: ReactUiStore; core: UiSnapshot }) {
   const memory = (core.bridgeMemory || core.environmentSnapshot.memory || {}) as any
   const settings = (core.environmentSnapshot.memory as any)?.settings || {}
-  const correction = memory.correction || {}
-  const persistedDraft = core.environmentStore.ui.memoryCorrectionDraft
-  const [draft, setDraft] = useState(String(persistedDraft ?? correction.content ?? ''))
-  const [preview, setPreview] = useState<any>(null)
-  const [message, setMessage] = useState('')
+  const source = memory.correction || {}
   const writable = core.status.capabilities?.diskWrite === true
-
-  useEffect(() => setDraft(String(core.environmentStore.ui.memoryCorrectionDraft ?? correction.content ?? '')), [correction.hash, core.environmentStore.revision])
-
-  const runPreview = async () => {
-    const result = await api.bridgeCall('/environment-injector/memory/preview-correction', {
-      content: draft,
-      ...(typeof correction.hash === 'string' ? { expectedHash: correction.hash } : {}),
-    })
-    setPreview(result.status === 'ok' ? result : null)
-    setMessage(result.status === 'ok' ? `预览完成：+${result.diff?.addedLines || 0} / -${result.diff?.removedLines || 0} 行` : result.message || '预览失败')
-  }
-
-  const commit = async () => {
-    if (!preview) return
-    const expectedHash = preview.before?.hash
-    const result = await api.bridgeCall('/environment-injector/memory/commit-correction', {
-      content: draft,
-      ...(typeof expectedHash === 'string' ? { expectedHash } : {}),
-    })
-    if (result.status !== 'ok') {
-      setPreview(null)
-      setMessage(result.status === 'conflict' ? '源文件已变化，请重新预览。' : result.message || '写入失败')
-      return
-    }
-    api.updateUiPreferences({ memoryCorrectionDraft: undefined })
-    await api.refreshBridge()
-    store.showToast(`Memory 修正 Note 已写入；备份：${result.backup || '新文件'}`, 'success')
-    setPreview(null)
-    setMessage('写入完成')
-  }
+  const { draft, preview, message, runPreview, commit, edit } = useDraftEditor({
+    api, store, source, persistedDraft: core.environmentStore.ui.memoryCorrectionDraft, draftKey: 'memoryCorrectionDraft',
+    previewPath: '/environment-injector/memory/preview-correction', commitPath: '/environment-injector/memory/commit-correction', label: 'Memory 修正 Note',
+  })
 
   return <>
     <ScopeHeader scope="全局" title="Memories" detail="全局记忆存储；单个环境可覆盖是否读取或生成。" />
     <MetaGrid rows={[
-      ['总开关', settings.enabled === true ? '开启' : '关闭'], ['读取记忆', String(settings.use_memories ?? '继承')], ['生成记忆', String(settings.generate_memories ?? '继承')],
+      ['总开关', settings.enabled === true ? '开启' : settings.enabled === false ? '关闭' : '未知 / 未读取'], ['读取记忆', String(settings.use_memories ?? '继承')], ['生成记忆', String(settings.generate_memories ?? '继承')],
       ['写入能力', writable ? 'Bridge 可写' : '只读 / 草案'], ['文件', Array.isArray(memory.files) ? `${memory.files.length} 个` : '未知'],
     ]} />
     <Disclosure title="Memory Summary" text={memory.summary?.content} defaultOpen />
@@ -204,54 +168,25 @@ function MemoryView({ api, store, core }: { api: CoreApi; store: ReactUiStore; c
     <section className="ei-card">
       <strong>记忆修正草案</strong>
       <p className="ei-help">只写稳定事实和纠正项；不会直接改写生成的 MEMORY.md。</p>
-      <textarea className="ei-textarea" value={draft} onChange={(event) => { setDraft(event.target.value); setPreview(null) }} />
+      <textarea className="ei-textarea" value={draft} onChange={(event) => edit(event.target.value)} />
       <div className="ei-actions">
         <Button onClick={() => { api.updateUiPreferences({ memoryCorrectionDraft: draft }); store.showToast('草案已保存') }}>保存草案</Button>
         <Button disabled={!writable} onClick={() => void runPreview()}>预览写入</Button>
         <Button primary disabled={!preview} onClick={() => void commit()}>确认写入</Button>
       </div>
-      <p className="ei-status" data-kind={preview ? 'success' : message ? 'error' : undefined}>{message}</p>
+      <Disclosure title="写入内容对比" text={preview?.comparison} defaultOpen />
+      <p className="ei-status" data-kind={preview ? 'success' : undefined}>{message}</p>
     </section>
   </>
 }
 
 function AgentsView({ api, store, core }: { api: CoreApi; store: ReactUiStore; core: UiSnapshot }) {
   const agents = (core.bridgeAgents || core.environmentSnapshot.globalAgents || {}) as any
-  const persistedDraft = core.environmentStore.ui.agentsDraft
-  const [draft, setDraft] = useState(String(persistedDraft ?? agents.content ?? ''))
-  const [preview, setPreview] = useState<any>(null)
-  const [message, setMessage] = useState('')
   const writable = core.status.capabilities?.diskWrite === true
-
-  useEffect(() => setDraft(String(core.environmentStore.ui.agentsDraft ?? agents.content ?? '')), [agents.hash, core.environmentStore.revision])
-
-  const runPreview = async () => {
-    const result = await api.bridgeCall('/environment-injector/agents/preview', {
-      content: draft,
-      ...(typeof agents.hash === 'string' ? { expectedHash: agents.hash } : {}),
-    })
-    setPreview(result.status === 'ok' ? result : null)
-    setMessage(result.status === 'ok' ? `预览完成：+${result.diff?.addedLines || 0} / -${result.diff?.removedLines || 0} 行` : result.message || '预览失败')
-  }
-
-  const commit = async () => {
-    if (!preview) return
-    const expectedHash = preview.before?.hash
-    const result = await api.bridgeCall('/environment-injector/agents/commit', {
-      content: draft,
-      ...(typeof expectedHash === 'string' ? { expectedHash } : {}),
-    })
-    if (result.status !== 'ok') {
-      setPreview(null)
-      setMessage(result.status === 'conflict' ? 'AGENTS.md 已变化，请重新预览。' : result.message || '写入失败')
-      return
-    }
-    api.updateUiPreferences({ agentsDraft: undefined })
-    await api.refreshBridge()
-    store.showToast(`AGENTS.md 已写入；备份：${result.backup || '新文件'}`, 'success')
-    setPreview(null)
-    setMessage('写入完成')
-  }
+  const { draft, preview, message, runPreview, commit, edit } = useDraftEditor({
+    api, store, source: agents, persistedDraft: core.environmentStore.ui.agentsDraft, draftKey: 'agentsDraft',
+    previewPath: '/environment-injector/agents/preview', commitPath: '/environment-injector/agents/commit', label: 'AGENTS.md',
+  })
 
   return <>
     <ScopeHeader scope="全局" title="AGENTS.md" detail="所有项目共享的稳定规则；项目目录中的 AGENTS.md 优先级更高。" />
@@ -261,14 +196,15 @@ function AgentsView({ api, store, core }: { api: CoreApi; store: ReactUiStore; c
     ]} />
     <section className="ei-card">
       <strong>AGENTS.md 草案</strong>
-      <textarea className="ei-textarea ei-textarea-tall" value={draft} onChange={(event) => { setDraft(event.target.value); setPreview(null) }} />
+      <textarea className="ei-textarea ei-textarea-tall" value={draft} onChange={(event) => edit(event.target.value)} />
       <div className="ei-actions">
         <Button onClick={() => { api.updateUiPreferences({ agentsDraft: draft }); store.showToast('AGENTS.md 草案已保存') }}>保存草案</Button>
         <Button onClick={() => navigator.clipboard.writeText(draft).then(() => store.showToast('已复制'))}>复制</Button>
         <Button disabled={!writable} onClick={() => void runPreview()}>预览写入</Button>
         <Button primary disabled={!preview} onClick={() => void commit()}>确认写入</Button>
       </div>
-      <p className="ei-status" data-kind={preview ? 'success' : message ? 'error' : undefined}>{message}</p>
+      <Disclosure title="写入内容对比" text={preview?.comparison} defaultOpen />
+      <p className="ei-status" data-kind={preview ? 'success' : undefined}>{message}</p>
     </section>
   </>
 }
@@ -322,7 +258,6 @@ export function InjectorApp({ api, store }: { api: CoreApi; store: ReactUiStore 
 
   return <UiErrorBoundary onError={(message) => store.showToast(message, 'error')}>
     <div className="ei-shell">
-      <button className="ei-pill" type="button" onClick={() => store.openFromPill()}>{pillLabel(state.core)}</button>
       {state.open ? <div className="ei-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) store.close() }}>
         <section className="ei-dialog" data-mode={state.mode} data-expanded={expanded} role="dialog" aria-modal="true" aria-label="环境注入器">
           <header className="ei-header ei-main-header" onDoubleClick={(event) => { if (!(event.target as Element).closest('button')) store.setExpanded(!expanded) }}>
@@ -333,7 +268,7 @@ export function InjectorApp({ api, store }: { api: CoreApi; store: ReactUiStore 
             <ScopeNavigation mode={state.mode} store={store} />
             <main className={`ei-body${state.mode === 'current' ? ' ei-body-current' : ''}`}>
               {state.mode === 'select' ? <SelectEnvironmentView store={store} core={state.core} title={state.title} /> : null}
-              {state.mode === 'current' ? <CurrentSessionView core={state.core} /> : null}
+              {state.mode === 'current' ? <CurrentSessionView core={state.core} api={api} /> : null}
               {state.mode === 'memory' ? <MemoryView api={api} store={store} core={state.core} /> : null}
               {state.mode === 'agents' ? <AgentsView api={api} store={store} core={state.core} /> : null}
               {state.mode === 'tutorial' ? <TutorialView store={store} /> : null}

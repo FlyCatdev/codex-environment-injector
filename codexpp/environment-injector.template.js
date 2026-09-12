@@ -1,10 +1,10 @@
-/* Codex++ Environment Injector v0.3.2 */
+/* Codex++ Environment Injector v0.4.0 */
 (() => {
   "use strict";
 
   const GLOBAL_KEY = "__codexEnvironmentInjector";
   const LEGACY_GLOBAL_KEY = "__codexPlusProfileSelector";
-  const VERSION = "0.3.2";
+  const VERSION = "0.4.0";
   const STORAGE_KEY = "codexpp.environmentInjector.v2";
   const LEGACY_SELECTOR_STORAGE_KEY = "codexpp.profileSelector.v1";
   const LEGACY_STUDIO_STORAGE_KEY = "codexpp.profileStudio.v1";
@@ -26,6 +26,13 @@
   const wrapperToken = {};
   const patchedClients = new Set();
   const environmentControllers = new Set();
+  const resumeRequests = new Map();
+  const profileDigests = new Map();
+  const eligiblePrewarms = new Map();
+  const profileSwitches = new Map();
+  const profileSwitchResults = new Map();
+  const profileSwitchSelections = new Map();
+  let selectionEpoch = 0;
   const replayTargets = new WeakSet();
   const modulePromises = new Map();
   const staticProfiles = Array.isArray(ENVIRONMENT_BUNDLE.profiles)
@@ -56,6 +63,10 @@
   let tutorialTab = null;
   let memoryRoot = null;
   let agentsRoot = null;
+  let memoryRenderEpoch = 0;
+  let agentsRenderEpoch = 0;
+  let activeMemoryEditor = null;
+  let activeAgentsEditor = null;
   let tutorialRoot = null;
   let panelFooter = null;
   let panelMode = "select";
@@ -83,6 +94,84 @@
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
 
+  function containsSensitiveData(value, depth = 0) {
+    if (depth > 32) throw new Error("配置嵌套过深");
+    if (typeof value === "string") {
+      let parsed;
+      try { parsed = JSON.parse(value); } catch {}
+      if (parsed && typeof parsed === "object") return containsSensitiveData(parsed, depth + 1);
+      return /\bsk-[A-Za-z0-9_-]{16,}\b|\bBearer\s+[A-Za-z0-9_./+=-]{12,}|[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@|\b(?:api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization|credential)["']\s*:|\b(?:api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|authorization|credential)["']?\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{12,}/i.test(value);
+    }
+    if (Array.isArray(value)) return value.some(item => containsSensitiveData(item, depth + 1));
+    if (!isObject(value)) return false;
+    return Object.entries(value).some(([key, item]) => {
+      const name = key.replace(/[-_\s]/g, "").toLowerCase();
+      return /(?:apikey|password|passwd|clientsecret|accesstoken|refreshtoken|authtoken|authorization|credentials?|authcontents)$/.test(name)
+        || ["token", "secret", "bearer"].includes(name)
+        || containsSensitiveData(item, depth + 1);
+    });
+  }
+
+  function assertSafeProfile(profile) {
+    if (!isObject(profile) || !/^[A-Za-z0-9_-]{1,100}$/.test(profile.id || "")
+        || ["__proto__", "constructor", "prototype"].includes(profile.id)) throw new Error("环境 ID 无效");
+    if (Object.hasOwn(profile, "config") && !isObject(profile.config)) throw new Error("Additional Config 必须是 JSON 对象");
+    for (const name of ["developerInstructions", "baseInstructions"]) {
+      if (profile[name] != null && (typeof profile[name] !== "string" || profile[name].length > 40000))
+        throw new Error("提示词必须为不超过 40000 字符的文本");
+    }
+    if (containsSensitiveData(profile)) throw new Error("环境包含敏感字段，已拒绝保存；请改用环境变量名或凭据存储");
+    const checkKeys = value => {
+      if (!value || typeof value !== "object") return;
+      for (const [key, item] of Object.entries(value)) {
+        if (["__proto__", "constructor", "prototype"].includes(key)) throw new Error("配置包含不安全字段");
+        checkKeys(item);
+      }
+    };
+    checkKeys(profile.config);
+    return true;
+  }
+
+  function assertSafeDraft(text) {
+    if (typeof text !== "string" || new TextEncoder().encode(text).length > 256 * 1024)
+      throw new Error("草案必须是不超过 256 KiB 的文本");
+    if (containsSensitiveData(text)) throw new Error("草案包含敏感内容，已拒绝保存");
+    return true;
+  }
+
+  function installEnvironmentStore(nextStore) {
+    let next;
+    try { next = JSON.parse(JSON.stringify(nextStore)); } catch { throw new Error("环境数据无法序列化"); }
+    if (!isObject(next) || next.schemaVersion !== STATE_VERSION || !isObject(next.profiles))
+      throw new Error("环境存储结构无效");
+    if (Number(next.revision) !== Number(environmentStore.revision)) throw new Error("环境已变化，请重新加载后保存");
+    if (Object.keys(next.profiles).length > 50) throw new Error("最多保存 50 个本地环境");
+    for (const profile of Object.values(next.profiles)) assertSafeProfile(profile);
+    for (const key of ["agentsDraft", "memoryCorrectionDraft"]) {
+      if (Object.hasOwn(next.ui || {}, key)) assertSafeDraft(next.ui[key]);
+    }
+    environmentStore = normalizeEnvironmentStore(next);
+    saveEnvironmentStore();
+    refreshProfileCatalog();
+    state = loadState();
+    renderProfileOptions();
+    updatePill();
+    return uiSnapshot();
+  }
+
+  function saveEnvironmentProfile(profile, options = {}) {
+    assertSafeProfile(profile);
+    if (options.expectedRevision != null && Number(options.expectedRevision) !== Number(environmentStore.revision))
+      throw new Error("环境已变化，请重新加载后保存");
+    const key = profile.targetProfileId ? `override:${profile.targetProfileId}` : profile.id;
+    const previousKey = String(options.previousKey || "");
+    if (Object.hasOwn(environmentStore.profiles, key) && key !== previousKey) throw new Error("环境 ID 已存在，不能覆盖另一环境");
+    const next = cloneJson(environmentStore);
+    if (previousKey && previousKey !== key) delete next.profiles[previousKey];
+    next.profiles[key] = cloneJson(profile);
+    return installEnvironmentStore(next);
+  }
+
   async function bridgeCall(path, payload = {}) {
     if (typeof window.__codexSessionDeleteBridge !== "function") {
       return { status: "unavailable", message: "Codex++ bridge unavailable" };
@@ -94,8 +183,9 @@
     }
   }
 
-  async function refreshBridgeState() {
+  async function refreshBridgeState({ renderEditors = true } = {}) {
     const capabilities = await bridgeCall("/environment-injector/capabilities", {});
+    if (destroyed) return;
     if (capabilities?.status !== "ok") {
       bridgeCapabilities = null;
       bridgeAgents = null;
@@ -107,10 +197,13 @@
       bridgeCall("/environment-injector/agents/get", {}),
       bridgeCall("/environment-injector/memory/get", {}),
     ]);
+    if (destroyed) return;
     bridgeAgents = agents?.status === "ok" ? agents : null;
     bridgeMemory = memory?.status === "ok" ? memory : null;
-    if (panelMode === "memory") renderMemoryView();
-    if (panelMode === "agents") renderAgentsView();
+    activeMemoryEditor?.refreshSource?.();
+    activeAgentsEditor?.refreshSource?.();
+    if (renderEditors && panelMode === "memory" && !activeMemoryEditor?.dirty) renderMemoryView();
+    if (renderEditors && panelMode === "agents" && !activeAgentsEditor?.dirty) renderAgentsView();
     updatePill();
   }
 
@@ -188,11 +281,18 @@
   function saveEnvironmentStore() {
     environmentStore.revision = Number(environmentStore.revision || 0) + 1;
     environmentStore.updatedAt = new Date().toISOString();
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(environmentStore)); } catch {}
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(environmentStore)); } catch {
+      environmentStore = cloneJson(lastCommittedStore);
+      refreshProfileCatalog();
+      state = loadState();
+      throw new Error("环境保存失败：本地存储不可写或配额不足；修改未保存");
+    }
+    lastCommittedStore = cloneJson(environmentStore);
     if (typeof CustomEvent === "function") window.dispatchEvent(new CustomEvent(UPDATE_EVENT));
   }
 
   let environmentStore = loadEnvironmentStore();
+  let lastCommittedStore = cloneJson(environmentStore);
   dialogExpanded = environmentStore.ui?.panelExpanded === true;
 
   function studioProfiles() {
@@ -242,6 +342,28 @@
     }
     profiles = catalog;
     profileMap = new Map(profiles.map((profile) => [profile.id, profile]));
+    let invalidate = false;
+    for (const profile of profiles) {
+      const signature = profileSignature(profile);
+      const previous = profileDigests.get(profile.id);
+      if (previous?.signature === signature) continue;
+      if (previous) invalidate = true;
+      const entry = { signature, digest: null };
+      profileDigests.set(profile.id, entry);
+      void profilePayloadDigest(profile).then(digest => {
+        if (destroyed || profileDigests.get(profile.id) !== entry) return;
+        entry.digest = digest;
+        updatePill();
+      });
+    }
+    for (const id of profileDigests.keys()) {
+      if (!profileMap.has(id)) { profileDigests.delete(id); invalidate = true; }
+    }
+    if (invalidate) {
+      selectionEpoch += 1;
+      eligiblePrewarms.clear();
+      discardPrewarmedThreads();
+    }
   }
 
   refreshProfileCatalog();
@@ -349,6 +471,17 @@
     saveState();
   }
 
+  function persistObservedBinding(threadId, profileId, metadata) {
+    try { bindThreadProfile(threadId, profileId, metadata); return true; } catch {
+      // Storage bookkeeping must never make an accepted RPC look rejected.
+      const id = normalizedThreadId(threadId);
+      state.threadProfiles[id] = { profileId, applied: false, source: "proof-storage-error", at: Date.now() };
+      state.proofByThread[id] = { profileId, status: "observed-unconfirmed", proofId: null, payloadDigest: null };
+      traceRequest("proof-storage-error", { threadId: id, profileId });
+      return false;
+    }
+  }
+
   function discardPrewarmedThreads() {
     for (const controller of environmentControllers) {
       const manager = ownValue(controller, "prewarmedThreadManager");
@@ -365,7 +498,9 @@
 
   function setPendingProfile(profileId) {
     const nextProfileId = validProfileId(profileId);
-    if (state.pendingProfileId !== nextProfileId) discardPrewarmedThreads();
+    selectionEpoch += 1;
+    eligiblePrewarms.clear();
+    discardPrewarmedThreads();
     state.pendingProfileId = nextProfileId;
     saveState();
   }
@@ -374,6 +509,12 @@
     if (state.pendingProfileId === profileId) {
       state.pendingProfileId = "";
       saveState();
+    }
+  }
+
+  function consumeObservedSelection(profileId) {
+    try { consumePendingProfile(profileId); } catch {
+      traceRequest("selection-storage-error", { profileId });
     }
   }
 
@@ -422,9 +563,19 @@
     return () => {
       if (uiAdapter !== adapter) return;
       uiAdapter = null;
-      if (pill) pill.hidden = false;
+      if (pill) pill.hidden = true;
       updatePill();
     };
+  }
+
+  function currentViewIdentity() {
+    const id = currentThreadId();
+    const binding = threadProfileEntry(id);
+    const proof = state.proofByThread[id];
+    const switching = currentSwitchStatus(id);
+    return [id, binding?.profileId || "base", String(binding?.applied), proof?.status || "",
+      String(proofMatchesProfile(proof, binding?.profileId)), state.pendingProfileId,
+      switching.phase || "", switching.result?.status || "", String(switching.available)].join("|");
   }
 
   function updatePill() {
@@ -435,7 +586,7 @@
     if (panelMode === "current" && panel && !panel.hidden) {
       const threadId = currentThreadId();
       const entry = threadProfileEntry(threadId);
-      const identity = [threadId, entry?.profileId || "base", String(entry?.applied), state.pendingProfileId].join("|");
+      const identity = currentViewIdentity();
       if (identity !== currentRenderIdentity) renderCurrentProfileView();
     }
     notifyUiAdapter();
@@ -571,8 +722,15 @@
     if (!entry) {
       return { kind: "base", label: "未由选择器管理", detail: "该会话没有 Profile 绑定记录，按 Base / Codex 全局配置运行。" };
     }
+    const proof = state.proofByThread?.[threadId];
+    if (entry.applied === true && proof?.status === "acknowledged"
+        && entry.proofId && entry.proofId === proof.proofId
+        && /^sha256:[0-9a-f]{64}$/i.test(proof.payloadDigest || "")
+        && proofMatchesProfile(proof, entry.profileId)) {
+      return { kind: "confirmed", label: "请求转发已确认", detail: "环境参数已转发并关联到该会话；最终模型行为仍需独立测试。" };
+    }
     if (entry.applied === true) {
-      return { kind: "confirmed", label: "已确认注入", detail: "选择器通过兼容的 thread 生命周期通道完成并记录了注入。" };
+      return { kind: "unconfirmed", label: "当前版本未确认", detail: "证明缺失、正在校验或对应旧版环境；编辑后的内容尚未确认转发。" };
     }
     if (entry.applied === false) {
       return { kind: "unconfirmed", label: "已选择 · 未确认注入", detail: "当前是 direct-RPC 通道；下方显示计划注入内容，不代表 Codex 最终已采用。" };
@@ -591,7 +749,7 @@
       ? state.proofByThread[threadId]
       : null;
     const status = currentBindingStatus(entry, threadId);
-    currentRenderIdentity = [threadId, profileId, String(entry?.applied), proof?.status || "", state.pendingProfileId].join("|");
+    currentRenderIdentity = currentViewIdentity();
 
     const hero = document.createElement("section");
     hero.className = "current-hero";
@@ -619,6 +777,41 @@
       hero.append(id);
     }
     currentRoot.append(hero);
+    if (threadId) {
+      const switchCard = document.createElement("section");
+      switchCard.className = "environment-editor-card";
+      const heading = document.createElement("strong");
+      heading.textContent = "切换当前对话的 Profile";
+      const choices = document.createElement("select");
+      for (const item of profiles) {
+        const option = document.createElement("option");
+        option.value = item.id; option.textContent = item.name;
+        choices.append(option);
+      }
+      choices.value = profileSwitchSelections.get(threadId) || profileId;
+      choices.addEventListener("change", () => {
+        profileSwitchSelections.set(threadId, choices.value);
+        while (profileSwitchSelections.size > MAX_THREAD_ENTRIES)
+          profileSwitchSelections.delete(profileSwitchSelections.keys().next().value);
+      }, { signal });
+      const feedback = document.createElement("p");
+      const availability = currentSwitchStatus(threadId);
+      feedback.textContent = availability.busy ? "正在更新原生会话设置…" : availability.result?.message || availability.reason;
+      const apply = createEnvironmentButton("应用到当前对话", async () => {
+        const selected = profileById(choices.value);
+        if (!window.confirm(`将本会话的热切项应用为“${selected.name}”？更新 Developer、模型、推理和 Service Tier；历史及后台服务保留，初始化配置不热切。${selected.modelProvider ? `Profile 指定 Provider：${selected.modelProvider}；仅允许与当前相同。` : ""}`)) return;
+        apply.disabled = true;
+        try { await switchThreadProfile(threadId, selected.id); } catch (error) {
+          feedback.textContent = error?.message || "切换未确认，请检查会话设置";
+        }
+        if (!destroyed && currentThreadId() === threadId) renderCurrentProfileView();
+      }, true);
+      apply.disabled = !availability.available || availability.busy;
+      const note = document.createElement("p");
+      note.textContent = "仅支持 Default 模式的空闲会话。Base 撤销本功能的附加角色规则；Provider、Base Instructions、插件、记忆初始化配置需新会话。";
+      switchCard.append(heading, choices, apply, feedback, note);
+      currentRoot.append(switchCard);
+    }
 
     if (state.pendingProfileId) {
       const pending = document.createElement("section");
@@ -728,9 +921,11 @@
 
   function renderMemoryView() {
     if (!memoryRoot) return;
+    const renderEpoch = ++memoryRenderEpoch;
+    const retainedDraft = activeMemoryEditor?.dirty ? activeMemoryEditor.textarea.value : null;
     memoryRoot.replaceChildren();
     const snapshotMemory = ENVIRONMENT_BUNDLE.environment?.memory || {};
-    const memory = bridgeMemory ? { ...snapshotMemory, ...bridgeMemory, settings: snapshotMemory.settings || {} } : snapshotMemory;
+    let memory = bridgeMemory ? { ...snapshotMemory, ...bridgeMemory, settings: snapshotMemory.settings || {} } : snapshotMemory;
     const settings = isObject(memory.settings) ? memory.settings : {};
     const bridgeWritable = bridgeCapabilities?.diskWrite === true;
     memoryRoot.append(createEnvironmentHeading(
@@ -739,7 +934,7 @@
     ));
     const meta = document.createElement("section");
     meta.className = "current-meta";
-    appendMetaRow(meta, "总开关", settings.enabled === true ? "已开启" : "已关闭");
+    appendMetaRow(meta, "总开关", settings.enabled === true ? "已开启" : settings.enabled === false ? "已关闭" : "未知 / 未读取");
     appendMetaRow(meta, "读取记忆", settings.use_memories === false ? "关闭" : settings.use_memories === true ? "开启" : "继承");
     appendMetaRow(meta, "生成记忆", settings.generate_memories === false ? "关闭" : settings.generate_memories === true ? "开启" : "继承");
     appendMetaRow(meta, "外部上下文排除", settings.disable_on_external_context === true ? "开启" : "关闭 / 未设置");
@@ -758,19 +953,33 @@
     const textarea = document.createElement("textarea");
     textarea.className = "environment-editor";
     textarea.placeholder = "例如：\n- 稳定偏好：默认使用简体中文。\n- 纠正：领域记忆只在 cwd/任务匹配时使用。\n- 不要把某个 Profile 的角色推广为全局记忆。";
-    textarea.value = String(environmentStore.ui?.memoryCorrectionDraft ?? memory.correction?.content ?? "");
+    textarea.value = String(retainedDraft ?? environmentStore.ui?.memoryCorrectionDraft ?? memory.correction?.content ?? "");
+    const editorState = { textarea, dirty: retainedDraft !== null, refreshSource: () => {
+      if (bridgeMemory) memory = { ...memory, ...bridgeMemory };
+    } };
+    activeMemoryEditor = editorState;
     const actions = document.createElement("div");
     actions.className = "environment-actions";
     const previewStatus = document.createElement("p");
     previewStatus.className = "environment-preview-status";
     let preview = null;
+    let previewGeneration = 0;
+    let committing = false;
+    const comparison = document.createElement("pre");
+    comparison.className = "current-pre";
     const commitButton = createEnvironmentButton("确认写入修正 Note", async () => {
-      if (!preview) return;
+      if (destroyed || committing || !preview || preview.content !== textarea.value
+          || preview.generation !== previewGeneration) return;
+      committing = true;
+      const submitted = preview.content;
+      const persistedDraftBefore = environmentStore.ui.memoryCorrectionDraft;
       const expectedHash = preview.before?.hash;
       const result = await bridgeCall("/environment-injector/memory/commit-correction", {
-        content: textarea.value,
+        content: submitted,
         ...(typeof expectedHash === "string" ? { expectedHash } : {}),
       });
+      committing = false;
+      if (destroyed || renderEpoch !== memoryRenderEpoch) return;
       if (result?.status === "conflict") {
         previewStatus.textContent = "源文件已变化，请重新预览。";
         previewStatus.dataset.kind = "error";
@@ -783,27 +992,52 @@
         previewStatus.dataset.kind = "error";
         return;
       }
+      if (textarea.value !== submitted || environmentStore.ui.memoryCorrectionDraft !== persistedDraftBefore) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "先前草案已写入，提交期间的新编辑已保留";
+        return;
+      }
       delete environmentStore.ui.memoryCorrectionDraft;
-      saveEnvironmentStore();
+      try { saveEnvironmentStore(); } catch {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入，但本地草案清理失败"; return;
+      }
       showToast(`Memory 修正 Note 已写入；备份：${result.backup || "新文件"}`);
-      await refreshBridgeState();
+      editorState.dirty = false;
+      await refreshBridgeState({ renderEditors: false });
+      if (destroyed || renderEpoch !== memoryRenderEpoch) return;
+      if (editorState.dirty || textarea.value !== submitted || environmentStore.ui.memoryCorrectionDraft !== undefined) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入；刷新期间的新编辑已保留，请重新预览"; return;
+      }
       renderMemoryView();
     }, true);
     commitButton.disabled = true;
+    textarea.addEventListener("input", () => {
+      editorState.dirty = true;
+      previewGeneration += 1; preview = null; commitButton.disabled = true; comparison.textContent = "";
+    }, { signal });
     actions.append(
       createEnvironmentButton("保存草案", () => {
+        try { assertSafeDraft(textarea.value); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         environmentStore.ui.memoryCorrectionDraft = textarea.value;
         saveEnvironmentStore();
         showToast("记忆修正草案已保存（尚未写入 Memory）");
       }),
       createEnvironmentButton("复制草案", () => { void copyEnvironmentText(textarea.value, "记忆草案已复制"); }),
       createEnvironmentButton("预览写入", async () => {
+        const generation = ++previewGeneration;
+        const content = textarea.value;
+        preview = null; commitButton.disabled = true;
+        try { assertSafeDraft(content); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         const expectedHash = memory.correction?.hash;
         const result = await bridgeCall("/environment-injector/memory/preview-correction", {
-          content: textarea.value,
+          content,
           ...(typeof expectedHash === "string" ? { expectedHash } : {}),
         });
-        preview = result?.status === "ok" ? result : null;
+        if (destroyed || renderEpoch !== memoryRenderEpoch || generation !== previewGeneration || content !== textarea.value) return;
+        preview = result?.status === "ok" ? { ...result, content, generation } : null;
+        comparison.textContent = preview ? `--- 当前磁盘内容\n${memory.correction?.content || ""}\n+++ 确认后写入内容\n${content}` : "";
         commitButton.disabled = !preview;
         previewStatus.dataset.kind = result?.status === "ok" ? "success" : "error";
         previewStatus.textContent = result?.status === "ok"
@@ -816,7 +1050,7 @@
     if (!bridgeWritable) {
       for (const button of [actions.children[2], commitButton]) button.disabled = true;
     }
-    editor.append(label, help, textarea, actions, previewStatus);
+    editor.append(label, help, textarea, actions, previewStatus, comparison);
     memoryRoot.append(editor);
     const note = document.createElement("p");
     note.className = "current-note";
@@ -828,8 +1062,10 @@
 
   function renderAgentsView() {
     if (!agentsRoot) return;
+    const renderEpoch = ++agentsRenderEpoch;
+    const retainedDraft = activeAgentsEditor?.dirty ? activeAgentsEditor.textarea.value : null;
     agentsRoot.replaceChildren();
-    const agents = bridgeAgents || ENVIRONMENT_BUNDLE.environment?.globalAgents || {};
+    let agents = bridgeAgents || ENVIRONMENT_BUNDLE.environment?.globalAgents || {};
     const bridgeWritable = bridgeCapabilities?.diskWrite === true;
     agentsRoot.append(createEnvironmentHeading(
       "全局 AGENTS.md",
@@ -852,19 +1088,33 @@
     help.textContent = "显式任务和选中环境应优先于泛化记忆；Memories 只作为背景事实。";
     const textarea = document.createElement("textarea");
     textarea.className = "environment-editor tall";
-    textarea.value = String(environmentStore.ui?.agentsDraft ?? agents.content ?? "");
+    textarea.value = String(retainedDraft ?? environmentStore.ui?.agentsDraft ?? agents.content ?? "");
+    const editorState = { textarea, dirty: retainedDraft !== null, refreshSource: () => {
+      if (bridgeAgents) agents = bridgeAgents;
+    } };
+    activeAgentsEditor = editorState;
     const actions = document.createElement("div");
     actions.className = "environment-actions";
     const previewStatus = document.createElement("p");
     previewStatus.className = "environment-preview-status";
     let preview = null;
+    let previewGeneration = 0;
+    let committing = false;
+    const comparison = document.createElement("pre");
+    comparison.className = "current-pre";
     const commitButton = createEnvironmentButton("确认写入 AGENTS.md", async () => {
-      if (!preview) return;
+      if (destroyed || committing || !preview || preview.content !== textarea.value
+          || preview.generation !== previewGeneration) return;
+      committing = true;
+      const submitted = preview.content;
+      const persistedDraftBefore = environmentStore.ui.agentsDraft;
       const expectedHash = preview.before?.hash;
       const result = await bridgeCall("/environment-injector/agents/commit", {
-        content: textarea.value,
+        content: submitted,
         ...(typeof expectedHash === "string" ? { expectedHash } : {}),
       });
+      committing = false;
+      if (destroyed || renderEpoch !== agentsRenderEpoch) return;
       if (result?.status === "conflict") {
         previewStatus.textContent = "AGENTS.md 已被外部修改，请重新预览。";
         previewStatus.dataset.kind = "error";
@@ -877,15 +1127,34 @@
         previewStatus.dataset.kind = "error";
         return;
       }
+      if (textarea.value !== submitted || environmentStore.ui.agentsDraft !== persistedDraftBefore) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "先前草案已写入，提交期间的新编辑已保留";
+        return;
+      }
       delete environmentStore.ui.agentsDraft;
-      saveEnvironmentStore();
+      try { saveEnvironmentStore(); } catch {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入，但本地草案清理失败"; return;
+      }
       showToast(`AGENTS.md 已写入；备份：${result.backup || "新文件"}`);
-      await refreshBridgeState();
+      editorState.dirty = false;
+      await refreshBridgeState({ renderEditors: false });
+      if (destroyed || renderEpoch !== agentsRenderEpoch) return;
+      if (editorState.dirty || textarea.value !== submitted || environmentStore.ui.agentsDraft !== undefined) {
+        preview = null; commitButton.disabled = true;
+        previewStatus.textContent = "文件已写入；刷新期间的新编辑已保留，请重新预览"; return;
+      }
       renderAgentsView();
     }, true);
     commitButton.disabled = true;
+    textarea.addEventListener("input", () => {
+      editorState.dirty = true;
+      previewGeneration += 1; preview = null; commitButton.disabled = true; comparison.textContent = "";
+    }, { signal });
     actions.append(
       createEnvironmentButton("保存草案", () => {
+        try { assertSafeDraft(textarea.value); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         environmentStore.ui.agentsDraft = textarea.value;
         saveEnvironmentStore();
         showToast("AGENTS.md 草案已保存（尚未写入磁盘）");
@@ -893,12 +1162,18 @@
       createEnvironmentButton("复制", () => { void copyEnvironmentText(textarea.value, "AGENTS.md 草案已复制"); }),
       createEnvironmentButton("导出 AGENTS.md", () => downloadEnvironmentText("AGENTS.md", textarea.value, "text/markdown")),
       createEnvironmentButton("预览写入", async () => {
+        const generation = ++previewGeneration;
+        const content = textarea.value;
+        preview = null; commitButton.disabled = true;
+        try { assertSafeDraft(content); } catch { previewStatus.textContent = "草案包含敏感内容或超出限制"; return; }
         const expectedHash = agents.hash;
         const result = await bridgeCall("/environment-injector/agents/preview", {
-          content: textarea.value,
+          content,
           ...(typeof expectedHash === "string" ? { expectedHash } : {}),
         });
-        preview = result?.status === "ok" ? result : null;
+        if (destroyed || renderEpoch !== agentsRenderEpoch || generation !== previewGeneration || content !== textarea.value) return;
+        preview = result?.status === "ok" ? { ...result, content, generation } : null;
+        comparison.textContent = preview ? `--- 当前磁盘内容\n${agents.content || ""}\n+++ 确认后写入内容\n${content}` : "";
         commitButton.disabled = !preview;
         previewStatus.dataset.kind = result?.status === "ok" ? "success" : "error";
         previewStatus.textContent = result?.status === "ok"
@@ -907,13 +1182,15 @@
       }),
       commitButton,
       createEnvironmentButton("恢复当前文件", () => {
+        editorState.dirty = false;
         textarea.value = String(agents.content || "");
+        previewGeneration += 1; preview = null; commitButton.disabled = true; comparison.textContent = "";
       }),
     );
     if (!bridgeWritable) {
       for (const button of [actions.children[3], commitButton]) button.disabled = true;
     }
-    editor.append(label, help, textarea, actions, previewStatus);
+    editor.append(label, help, textarea, actions, previewStatus, comparison);
     agentsRoot.append(editor);
     const note = document.createElement("p");
     note.className = "current-note";
@@ -1356,7 +1633,7 @@
     toastNode.className = "toast";
     toastNode.hidden = true;
 
-    shadow.append(style, panel, toastNode, pill);
+    shadow.append(style, panel, toastNode);
     document.documentElement.append(host);
     updatePill();
   }
@@ -1386,12 +1663,13 @@
     event.stopImmediatePropagation();
     const selected = await chooseProfile("为新对话选择环境");
     if (!selected || destroyed) return;
+    setPendingProfile(selected);
     pendingThreadObservation = {
       profileId: validProfileId(selected),
       previousThreadId: currentThreadId(),
       at: Date.now(),
+      epoch: selectionEpoch,
     };
-    setPendingProfile(selected);
     replayTargets.add(target);
     try {
       target.click();
@@ -1434,10 +1712,10 @@
     }
     if (profile.model) next.model = profile.model;
     if (profile.modelProvider) next.modelProvider = profile.modelProvider;
-    if (typeof profile.developerInstructions === "string") {
+    if (typeof profile.developerInstructions === "string" && profile.developerInstructions.trim()) {
       next.developerInstructions = profile.developerInstructions;
     }
-    if (typeof profile.baseInstructions === "string") {
+    if (typeof profile.baseInstructions === "string" && profile.baseInstructions.trim()) {
       next.baseInstructions = profile.baseInstructions;
     }
     const hasUnifiedPermissions = Object.hasOwn(next, "permissions") && next.permissions != null;
@@ -1483,7 +1761,20 @@
 
   async function profilePayloadDigest(profile) {
     try {
-      const encoded = new TextEncoder().encode(JSON.stringify(canonicalizeForDigest({
+      const signature = profileSignature(profile);
+      const encoded = new TextEncoder().encode(signature);
+      const digest = await crypto.subtle.digest("SHA-256", encoded);
+      const result = "sha256:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      const entry = profileDigests.get(profile?.id || "base");
+      if (!destroyed && entry?.signature === signature) entry.digest = result;
+      return result;
+    } catch {
+      return null;
+    }
+  }
+
+  function profileSignature(profile) {
+    return JSON.stringify(canonicalizeForDigest({
         id: profile?.id || "base",
         model: profile?.model || "",
         modelProvider: profile?.modelProvider || "",
@@ -1494,12 +1785,24 @@
         sandbox: profile?.sandbox || "",
         serviceTier: profile?.serviceTier || "",
         memoryPolicy: profile?.memoryPolicy || {},
-      })));
-      const digest = await crypto.subtle.digest("SHA-256", encoded);
-      return "sha256:" + Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    } catch {
-      return null;
+    }));
+  }
+
+  function proofMatchesProfile(proof, profileId) {
+    if (proof?.profileId !== profileId || !proof?.payloadDigest
+        || profileDigests.get(profileId)?.digest !== proof.payloadDigest) return false;
+    if (proof.transport === "native-thread-settings-profile-switch") {
+      const threadId = Object.entries(state.proofByThread).find(([, entry]) => entry.proofId === proof.proofId)?.[0];
+      const target = threadId && findSwitchController(threadId);
+      const mode = target?.conversation?.latestCollaborationMode;
+      const text = mode?.settings?.developer_instructions;
+      if (mode?.mode !== "default" || !isManagedProfileInstructions(text)) return false;
+      try {
+        const data = JSON.parse(text.slice(text.lastIndexOf("\n") + 1));
+        return data.applicationId === proof.proofId && data.profileId === profileId;
+      } catch { return false; }
     }
+    return true;
   }
 
   function recordThreadProof(threadId, proof) {
@@ -1509,7 +1812,7 @@
     state.proofByThread[id] = {
       proofId,
       profileId: validProfileId(proof.profileId),
-      profileRevision: Number(environmentStore.revision || 0),
+      profileRevision: Number(proof.profileRevision ?? environmentStore.revision ?? 0),
       status: String(proof.status || "acknowledged"),
       method: String(proof.method || ""),
       transport: String(proof.transport || ""),
@@ -1646,9 +1949,27 @@
     return "";
   }
 
-  function observePendingProfileForTurn(type, payload) {
+  function observePendingProfileForTurn(type, payload, confirmed = true) {
+    if (destroyed || !confirmed) return;
+    // Reading turn/start is observational only: never rewrite its model,
+    // permissions, or content. Consume a prewarm choice only once actually used.
+    const observedId = turnStartThreadId(type, payload);
+    const binding = observedId && threadProfileEntry(observedId);
+    const proof = observedId && state.proofByThread[observedId];
+    const eligible = observedId && eligiblePrewarms.get(observedId);
+    if (binding?.profileId === state.pendingProfileId && binding.applied === true
+        && eligible?.epoch === selectionEpoch && eligible.profileId === binding.profileId
+        && eligible.signature === profileSignature(profileById(binding.profileId))
+        && proof?.status === "acknowledged" && binding.proofId === proof.proofId
+        && proofMatchesProfile(proof, binding.profileId)) {
+      eligiblePrewarms.delete(observedId);
+      consumeObservedSelection(binding.profileId);
+      pendingThreadObservation = null;
+      return;
+    }
     const pending = pendingThreadObservation;
     if (!pending) return;
+    if (pending.epoch !== selectionEpoch) { pendingThreadObservation = null; return; }
     if (Date.now() - pending.at > 2 * 60_000) {
       pendingThreadObservation = null;
       return;
@@ -1658,15 +1979,15 @@
     pendingThreadObservation = null;
     const existing = threadProfileEntry(threadId);
     if (existing?.profileId === pending.profileId) {
-      consumePendingProfile(pending.profileId);
+      consumeObservedSelection(pending.profileId);
       showToast(existing.applied === true
         ? `环境已确认：${profileDisplayName(pending.profileId)}`
         : `已记录会话环境：${profileDisplayName(pending.profileId)}（未确认注入）`);
       return;
     }
     if (!existing) {
-      bindThreadProfile(threadId, pending.profileId, { applied: false, source: "direct-rpc-turn-start" });
-      consumePendingProfile(pending.profileId);
+      persistObservedBinding(threadId, pending.profileId, { applied: false, source: "direct-rpc-turn-start" });
+      consumeObservedSelection(pending.profileId);
       showToast(`已记录会话环境：${profileDisplayName(pending.profileId)}（未确认注入）`);
       traceRequest("direct-rpc-thread-observed", { threadId, profileId: pending.profileId });
     }
@@ -1708,15 +2029,19 @@
     }
     const threadId = findThreadId(payload) || findThreadId({ params: payload });
     if (!threadId) return;
-    bindThreadProfile(threadId, pending.profileId, { applied: true, source: "dispatcher-thread-started" });
-    if (pending.kind === "thread/start") consumePendingProfile(pending.profileId);
-    showToast(`会话环境：${pending.profileName}`);
-    traceRequest("thread-started", { kind: pending.kind, profileId: pending.profileId, threadId });
+    // This broadcast carries no matching request identity. It must not bind an
+    // unrelated thread or fabricate acknowledgment; direct RPC owns that proof.
+    showToast("观察到会话创建通知，环境转发尚未确认");
+    traceRequest("dispatcher-thread-observed-unconfirmed", { kind: pending.kind, profileId: pending.profileId, threadId });
     pendingStartBinding = null;
   }
 
   function traceRequest(stage, details = {}) {
-    requestTrace.push({ at: new Date().toISOString(), stage, ...details });
+    if (destroyed) return;
+    // Upstream errors may echo instructions, configuration or credentials.
+    const safe = { ...details };
+    if (Object.hasOwn(safe, "error")) safe.error = "请求失败（原始错误内容已隐藏）";
+    requestTrace.push({ at: new Date().toISOString(), stage, ...safe });
     if (requestTrace.length > 24) requestTrace.splice(0, requestTrace.length - 24);
   }
 
@@ -1840,7 +2165,8 @@
     if (member.descriptor.writable === false || member.descriptor.configurable === false) return null;
     let source = "";
     try { source = Function.prototype.toString.call(member.descriptor.value); } catch {}
-    if (!source.includes("enqueueRequest") && !source.includes("sendConfigReadRequest")) return null;
+    const alreadyWrapped = member.descriptor.value?.[WRAPPER_MARK] === wrapperToken;
+    if (!alreadyWrapped && !source.includes("enqueueRequest") && !source.includes("sendConfigReadRequest")) return null;
     return {
       controller: value,
       client: requestClient,
@@ -1859,24 +2185,30 @@
     if (descriptor.writable === false || descriptor.configurable === false) return false;
     if (descriptor.value?.[WRAPPER_MARK] === wrapperToken) return false;
     const previous = descriptor.value;
-    const wrapped = async function codexEnvironmentPrewarmThreadStart(request, options) {
+    const wrapped = async function codexEnvironmentPrewarmThreadStart(request, ...rest) {
       const profileId = state.pendingProfileId;
-      if (!profileId) return previous.call(this, request, options);
+      if (destroyed || !profileId || request?.[INJECTED_PARAMS_MARK] === true)
+        return previous.call(this, request, ...rest);
       const profile = profileById(profileId);
+      const pendingEpoch = selectionEpoch;
+      const signature = profileSignature(profile);
+      const profileRevision = Number(environmentStore.revision || 0);
       const patchedRequest = markInjectedParams(applyProfileToParams(request, profile));
       const fields = injectedFieldsFromParams(request, patchedRequest);
       const dispatchedAt = new Date().toISOString();
       const digestPromise = profilePayloadDigest(profile);
       traceRequest("prewarm-environment-dispatched", { profileId: profile.id, fields });
       try {
-        const result = await previous.call(this, patchedRequest, options);
-        const threadId = findThreadId(result) || findThreadId(patchedRequest);
+        const result = await previous.call(this, patchedRequest, ...rest);
+        const threadId = findThreadId(result);
         const payloadDigest = await digestPromise;
+        if (destroyed) return result;
         if (threadId) {
           const acknowledgedAt = new Date().toISOString();
           const proofId = recordThreadProof(threadId, {
             profileId: profile.id,
-            status: "acknowledged",
+            profileRevision,
+            status: payloadDigest ? "acknowledged" : "observed-unconfirmed",
             method: "thread/start",
             transport: "prewarm-thread-start-prototype",
             fields,
@@ -1884,13 +2216,18 @@
             dispatchedAt,
             acknowledgedAt,
           });
-          bindThreadProfile(threadId, profile.id, {
-            applied: true,
+          if (!persistObservedBinding(threadId, profile.id, {
+            applied: !!payloadDigest,
             source: "prewarm-thread-start-prototype",
             proofId,
-          });
-          showToast(`环境预热完成：${profile.name}`);
-          traceRequest("prewarm-environment-acknowledged", { threadId, profileId: profile.id, proofId });
+          })) return result;
+          showToast(`环境预热${payloadDigest ? "转发已确认" : "证明不完整"}：${profile.name}`);
+          if (pendingEpoch === selectionEpoch && state.pendingProfileId === profile.id
+              && signature === profileSignature(profileById(profile.id))) {
+            eligiblePrewarms.set(threadId, { epoch: pendingEpoch, profileId: profile.id, signature });
+          }
+          traceRequest(payloadDigest ? "prewarm-environment-acknowledged" : "prewarm-environment-unconfirmed",
+            { threadId, profileId: profile.id, proofId });
         }
         return result;
       } catch (error) {
@@ -1927,9 +2264,12 @@
     if (descriptor.value?.[WRAPPER_MARK] === wrapperToken) return prewarmPatched;
     const previous = descriptor.value;
     const wrapped = async function codexEnvironmentSendRequest(method, params, ...rest) {
+      if (destroyed) return previous.call(this, method, params, ...rest);
       const descriptorInfo = requestDescriptor(method, params);
-      if (!descriptorInfo || descriptorInfo.prewarm) {
-        return previous.call(this, method, params, ...rest);
+      if (!descriptorInfo || descriptorInfo.prewarm || descriptorInfo.params?.[INJECTED_PARAMS_MARK] === true) {
+        const result = await previous.call(this, method, params, ...rest);
+        observePendingProfileForTurn(method, params);
+        return result;
       }
       let profileId = "";
       if (descriptorInfo.kind === "thread/start") {
@@ -1941,21 +2281,54 @@
         profileId = threadProfileId(descriptorInfo.params?.threadId) || state.pendingProfileId || "base";
       }
       const profile = profileById(profileId || "base");
+      const profileRevision = Number(environmentStore.revision || 0);
+      const resumeId = descriptorInfo.kind === "thread/resume"
+        ? normalizedThreadId(descriptorInfo.params?.threadId) : "";
+      const requestToken = {};
+      if (resumeId) resumeRequests.set(resumeId, requestToken);
+      const canRecord = () => !destroyed && (!resumeId || resumeRequests.get(resumeId) === requestToken);
       const patchedParams = markInjectedParams(applyProfileToParams(descriptorInfo.params, profile));
       const nextParams = descriptorInfo.rebuild(patchedParams);
       const fields = injectedFieldsFromParams(descriptorInfo.params, patchedParams);
       const dispatchedAt = new Date().toISOString();
       const digestPromise = profilePayloadDigest(profile);
       traceRequest("direct-rpc-dispatched", { method: String(method || ""), profileId: profile.id, fields });
+      if (resumeId) {
+        const proofId = recordThreadProof(resumeId, {
+          profileId: profile.id, profileRevision, status: "dispatched",
+          method: descriptorInfo.kind, transport: "app-server-request-client-prototype",
+          fields, dispatchedAt,
+        });
+        persistObservedBinding(resumeId, profile.id, {
+          applied: false, source: "app-server-request-client-prototype", proofId,
+        });
+      }
       try {
         const result = await previous.call(this, method, nextParams, ...rest);
-        const threadId = findThreadId(result) || findThreadId(patchedParams);
+        let threadId = findThreadId(result) || resumeId;
+        // A fork's input id is its parent, not evidence of a new child.
+        if (descriptorInfo.kind === "thread/fork"
+            && threadId === normalizedThreadId(descriptorInfo.params?.threadId)) threadId = "";
         const payloadDigest = await digestPromise;
+        if (!canRecord()) return result;
+        if (resumeId && threadId !== resumeId) {
+          const proofId = recordThreadProof(resumeId, {
+            profileId: profile.id, profileRevision, status: "observed-unconfirmed",
+            method: descriptorInfo.kind, transport: "app-server-request-client-prototype",
+            fields, payloadDigest, dispatchedAt,
+          });
+          persistObservedBinding(resumeId, profile.id, {
+            applied: false, source: "app-server-request-client-prototype", proofId,
+          });
+          traceRequest("direct-rpc-response-thread-mismatch", { method: descriptorInfo.kind, profileId: profile.id });
+          return result;
+        }
         if (threadId) {
           const acknowledgedAt = new Date().toISOString();
           const proofId = recordThreadProof(threadId, {
             profileId: profile.id,
-            status: "acknowledged",
+            profileRevision,
+            status: payloadDigest ? "acknowledged" : "observed-unconfirmed",
             method: descriptorInfo.kind,
             transport: "app-server-request-client-prototype",
             fields,
@@ -1963,20 +2336,38 @@
             dispatchedAt,
             acknowledgedAt,
           });
-          bindThreadProfile(threadId, profile.id, {
-            applied: true,
+          if (!persistObservedBinding(threadId, profile.id, {
+            applied: !!payloadDigest,
             source: "app-server-request-client-prototype",
             proofId,
-          });
-          if (descriptorInfo.kind === "thread/start") consumePendingProfile(profile.id);
+          })) return result;
+          if (descriptorInfo.kind === "thread/start") consumeObservedSelection(profile.id);
           pendingThreadObservation = null;
-          showToast(`环境已注入：${profile.name}`);
-          traceRequest("direct-rpc-acknowledged", { threadId, profileId: profile.id, proofId });
+          showToast(`环境${payloadDigest ? "转发已确认" : "证明不完整"}：${profile.name}`);
+          traceRequest(payloadDigest ? "direct-rpc-acknowledged" : "direct-rpc-unconfirmed",
+            { threadId, profileId: profile.id, proofId });
+        } else {
+          traceRequest("direct-rpc-unconfirmed", { method: descriptorInfo.kind, profileId: profile.id });
         }
         return result;
       } catch (error) {
+        if (resumeId && canRecord()) {
+          const payloadDigest = await digestPromise;
+          if (canRecord()) {
+            const proofId = recordThreadProof(resumeId, {
+              profileId: profile.id, profileRevision, status: "failed",
+              method: descriptorInfo.kind, transport: "app-server-request-client-prototype",
+              fields, payloadDigest, dispatchedAt,
+            });
+            persistObservedBinding(resumeId, profile.id, {
+              applied: false, source: "app-server-request-client-prototype", proofId,
+            });
+          }
+        }
         traceRequest("direct-rpc-error", { method: String(method || ""), profileId: profile.id, error: String(error?.message || error) });
         throw error;
+      } finally {
+        if (resumeId && resumeRequests.get(resumeId) === requestToken) resumeRequests.delete(resumeId);
       }
     };
     Object.defineProperty(wrapped, WRAPPER_MARK, { value: wrapperToken });
@@ -2015,7 +2406,7 @@
     const previous = descriptor.value;
     const wrapped = function codexProfileSelectorDispatchMessage(type, payload) {
       const rawType = String(type || "");
-      observePendingProfileForTurn(type, payload);
+      observePendingProfileForTurn(type, payload, false);
       let prepared = null;
       try {
         prepared = prepareDispatcherRequest(type, payload);
@@ -2074,7 +2465,27 @@
   }
 
   function patchClient(value) {
+    if (destroyed) return false;
     return patchDirectRpcTarget(value) || patchDispatcher(value);
+  }
+
+  function waitForAsset(promise) {
+    return new Promise(resolve => {
+      if (destroyed) { resolve(null); return; }
+      let done = false;
+      let timer = 0;
+      const finish = value => {
+        if (done) return;
+        done = true;
+        window.clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        resolve(value);
+      };
+      const abort = () => finish(null);
+      signal.addEventListener("abort", abort, { once: true });
+      timer = window.setTimeout(() => finish(null), 2000);
+      Promise.resolve(promise).then(finish, () => finish(null));
+    });
   }
 
   function patchedClientDiagnostics() {
@@ -2211,23 +2622,28 @@
     scanAttempts += 1;
     let patched = 0;
     try {
+      patched += patchFromReactFibers();
       for (const url of preferredAssetUrls()) {
         try {
-          const module = await importAsset(url);
+          const module = await waitForAsset(importAsset(url));
+          if (destroyed) return;
+          if (!module) continue;
           for (const candidate of moduleCandidates(module)) {
             healLegacySendRequestShadow(candidate);
             if (patchClient(candidate)) patched += 1;
           }
         } catch {}
       }
+      if (destroyed) return;
       patched += patchFromReactFibers();
       lastPatchError = "";
     } catch (error) {
       lastPatchError = String(error?.stack || error?.message || error);
     } finally {
       scanInFlight = false;
-      updatePill();
+      if (!destroyed) updatePill();
     }
+    if (destroyed) return;
     const delay = patched > 0 || patchedClients.size > 0
       ? 30000
       : Math.min(15000, 500 * Math.max(1, scanAttempts));
@@ -2252,6 +2668,14 @@
     }
     patchedClients.clear();
     environmentControllers.clear();
+    resumeRequests.clear();
+    eligiblePrewarms.clear();
+    for (const op of profileSwitches.values()) { try { op.listenerDispose?.(); } catch {} }
+    profileSwitches.clear();
+    profileSwitchResults.clear();
+    profileSwitchSelections.clear();
+    activeMemoryEditor = null;
+    activeAgentsEditor = null;
     try { uiAdapter?.destroy?.(); } catch {}
     uiAdapter = null;
     host?.remove();
@@ -2260,6 +2684,215 @@
       delete window[LEGACY_GLOBAL_KEY];
     }
     if (currentApi?.version === VERSION) delete window[GLOBAL_KEY];
+  }
+
+  function buildProfileInstructions(profile, applicationId) {
+    return "# Codex++ Active Conversation Profile\n"
+      + "The user explicitly selected the active conversation profile below. Earlier custom profile-specific roles and output-format rules are superseded by this selection. "
+      + "Platform and safety instructions, AGENTS guidance, and current user requests remain effective. Base adds no custom profile rules. Do not explain this control block.\n"
+      + JSON.stringify({ applicationId, profileId: profile.id, instructions: profile.developerInstructions || "" });
+  }
+
+  function isManagedProfileInstructions(text) {
+    if (typeof text !== "string" || text.length > 120000 || !text.startsWith("# Codex++ Active Conversation Profile\n")) return false;
+    try {
+      const data = JSON.parse(text.slice(text.lastIndexOf("\n") + 1));
+      return typeof data.applicationId === "string" && data.applicationId.startsWith("apply-")
+        && typeof data.profileId === "string" && typeof data.instructions === "string"
+        && text === buildProfileInstructions({ id: data.profileId, developerInstructions: data.instructions }, data.applicationId);
+    } catch { return false; }
+  }
+
+  function findSwitchController(threadId) {
+    const candidates = [];
+    for (const controller of environmentControllers) {
+      if (ownValue(controller, "disposed") === true || ownValue(controller, "hostId") !== "local") continue;
+      const methods = {};
+      for (const name of ["getConversation", "getThreadExecutionState", "getStreamRole", "runThreadSettingsUpdate", "updateConversationState"])
+        methods[name] = callableMember(controller, name)?.descriptor?.value;
+      if (Object.values(methods).some(method => typeof method !== "function")) continue;
+      try {
+        const conversation = methods.getConversation.call(controller, threadId);
+        if (!conversation || normalizedThreadId(conversation.id) !== threadId) continue;
+        const getRole = callableMember(controller, "getStreamRole")?.descriptor?.value;
+        if (!getRole || getRole.call(controller, threadId)?.role !== "owner") continue;
+        const client = ownValue(controller, "requestClient");
+        if (!client || typeof callableMember(client, "sendRequest")?.descriptor?.value !== "function") continue;
+        candidates.push({ controller, client, methods, conversation });
+      } catch {}
+    }
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  function currentSwitchStatus(threadId) {
+    const op = profileSwitches.get(threadId);
+    if (op) return {
+      busy: !op.quarantined, available: false, blocked: !!op.quarantined,
+      phase: op.phase, profileId: op.profile.id,
+      reason: op.quarantined ? "更新结果未知，暂不允许重复切换；等待迟到响应或重开应用后核对" : "正在切换",
+      result: profileSwitchResults.get(threadId) || null,
+    };
+    const target = threadId ? findSwitchController(threadId) : null;
+    let inProgress = false;
+    try { inProgress = target?.methods.getThreadExecutionState.call(target.controller, threadId)?.inProgress === true; } catch { inProgress = true; }
+    const mode = target?.conversation?.latestCollaborationMode?.mode || "default";
+    const otherInstructions = target?.conversation?.latestCollaborationMode?.settings?.developer_instructions;
+    const conflict = mode !== "default" || (otherInstructions?.trim() && !isManagedProfileInstructions(otherInstructions));
+    return {
+      busy: false, available: !!target && !inProgress && !conflict,
+      reason: !target ? "请先打开一个已加载的本地会话" : inProgress ? "请等待当前生成结束" : conflict ? "请先恢复默认协作模式，再应用 Profile" : "",
+      result: profileSwitchResults.get(threadId) || null,
+    };
+  }
+
+  async function switchThreadProfile(threadId, requestedProfileId) {
+    const id = normalizedThreadId(threadId);
+    if (destroyed || !id) throw new Error("注入器不可用或未选择会话");
+    if (!profileMap.has(requestedProfileId)) throw new Error("目标环境不存在");
+    if (profileSwitches.has(id)) throw new Error("该会话仍在切换或等待未知结果，请勿重复提交");
+    const profile = cloneJson(profileById(requestedProfileId));
+    assertSafeProfile({ ...profile, id: profile.id.startsWith("studio:") ? profile.id.slice(7) : profile.id });
+    const target = findSwitchController(id);
+    if (!target) throw new Error("请先在当前窗口打开一个本地会话");
+    const { controller, client, methods } = target;
+    const previous = threadProfileEntry(id);
+    if (profile.baseInstructions?.trim() || (previous && profileById(previous.profileId).baseInstructions?.trim()))
+      throw new Error("Base Instructions 不能原地替换或撤销，请新建会话");
+    const safeErrors = new WeakSet();
+    const safeError = text => { const error = new Error(text); safeErrors.add(error); return error; };
+    const op = { threadId: id, profile, signature: profileSignature(profile), phase: "queued",
+      controller, client, dispatched: false, updateInvoked: false, serverAcknowledged: false,
+      transportFulfilled: false, cancelled: false, quarantined: false, listenerDispose: null };
+    const alive = () => {
+      if (destroyed || op.cancelled || profileSwitches.get(id) !== op) throw safeError("操作已取消或超时，结果未确认");
+    };
+    const check = () => {
+      alive();
+      const latest = methods.getConversation.call(controller, id);
+      if (!latest || methods.getStreamRole.call(controller, id)?.role !== "owner") throw safeError("会话已由其他窗口接管，请重新打开");
+      if (methods.getThreadExecutionState.call(controller, id)?.inProgress === true) throw safeError("会话正在执行，请等待结束");
+      if (latest.threadStartKind === "realtime_voice" || latest.threadSource === "voice_chat") throw safeError("语音会话不支持热切");
+      if ((latest.latestCollaborationMode?.mode || "default") !== "default") throw safeError("请先退出 Plan 模式");
+      const instructions = latest.latestCollaborationMode?.settings?.developer_instructions;
+      if (instructions?.trim() && !isManagedProfileInstructions(instructions)) throw safeError("存在其他自定义协作指令，不能自动覆盖");
+      if (op.signature !== profileSignature(profileById(profile.id))) throw safeError("目标 Profile 已变化，请重新选择");
+      return latest;
+    };
+    profileSwitches.set(id, op);
+    updatePill();
+    let timer = 0;
+    try {
+      const queued = methods.runThreadSettingsUpdate.call(controller, id, async () => {
+        op.phase = "checking";
+        check();
+        const metadata = await client.sendRequest("thread/read", { threadId: id, includeTurns: false }, { priority: "critical", timeoutMs: 5000 });
+        check();
+        if (findThreadId(metadata) !== id || metadata?.thread?.status?.type !== "idle") throw safeError("服务器会话不是空闲状态");
+        if (profile.modelProvider && profile.modelProvider !== metadata.thread.modelProvider) throw safeError("Provider 不同，请新建会话使用该 Profile");
+        const digest = await profilePayloadDigest(profile);
+        const latest = check();
+        const model = profile.model || latest.latestModel || metadata.thread.model;
+        if (!model) throw safeError("无法确认当前模型");
+        const effort = profile.config?.model_reasoning_effort
+          || (Object.hasOwn(latest, "latestReasoningEffort") ? latest.latestReasoningEffort : metadata.thread.reasoningEffort) || null;
+        const applicationId = `apply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        const instructions = buildProfileInstructions(profile, applicationId);
+        const settings = {
+          model, effort,
+          collaborationMode: { mode: "default", settings: { model, reasoning_effort: effort, developer_instructions: instructions } },
+          ...(profile.serviceTier ? { serviceTier: profile.serviceTier } : {}),
+        };
+        const listen = callableMember(client, "addRequestLifecycleListener")?.descriptor?.value;
+        if (!listen) throw safeError("客户端无法提供设置请求的关联证明");
+        const revision = Number(environmentStore.revision || 0);
+        const dispatchedAt = new Date().toISOString();
+        const pendingProof = {
+          proofId: applicationId, profileId: profile.id, profileRevision: revision,
+          method: "thread/settings/update", transport: "native-thread-settings-profile-switch",
+          fields: Object.keys(settings), payloadDigest: digest, dispatchedAt,
+        };
+        recordThreadProof(id, { ...pendingProof, status: "planned" });
+        if (!persistObservedBinding(id, previous?.profileId || "base", {
+          applied: false, source: "profile-switch-pending", proofId: applicationId,
+        })) throw safeError("无法保存待确认状态，未发送设置更新");
+        op.phase = "applying";
+        op.listenerDispose = listen.call(client, event => {
+          if (destroyed || op.cancelled || profileSwitches.get(id) !== op || event.method !== "thread/settings/update") return;
+          if (event.type === "started" && event.params?.threadId === id
+              && event.params?.collaborationMode?.settings?.developer_instructions === instructions) {
+            op.requestId = event.id; op.dispatched = true;
+          }
+          if (event.type === "completed" && op.requestId != null && event.id === op.requestId) op.serverAcknowledged = true;
+        });
+        check();
+        updatePill();
+        const settingsBefore = methods.getConversation.call(controller, id)?.latestThreadSettings;
+        op.updateInvoked = true;
+        await client.sendRequest("thread/settings/update", { threadId: id, ...settings }, { priority: "critical", timeoutMs: 10000 });
+        op.transportFulfilled = true;
+        alive();
+        if (!op.serverAcknowledged) throw safeError("设置响应未能关联，当前状态未确认");
+        // Same native queue, and the same fields used by the native settings reducer.
+        if (methods.getConversation.call(controller, id)?.latestThreadSettings === settingsBefore) {
+          methods.updateConversationState.call(controller, id, value => {
+            value.latestThreadSettings = { ...value.latestThreadSettings, ...settings };
+            value.latestModel = model;
+            value.latestReasoningEffort = effort;
+            value.latestCollaborationMode = settings.collaborationMode;
+          });
+        }
+        const proofId = recordThreadProof(id, {
+          ...pendingProof, status: digest ? "acknowledged" : "observed-unconfirmed", acknowledgedAt: new Date().toISOString(),
+        });
+        const persisted = persistObservedBinding(id, profile.id, {
+          applied: !!digest, source: "native-thread-settings-profile-switch", proofId,
+        });
+        const confirmed = persisted && !!digest && proofMatchesProfile(state.proofByThread[id], profile.id);
+        const deferredFields = [];
+        if (Object.keys(profile.config || {}).some(key => key !== "model_reasoning_effort")) deferredFields.push("附加 Config");
+        if (profile.memoryPolicy && [profile.memoryPolicy.use, profile.memoryPolicy.generate].some(value => value && value !== "inherit")) deferredFields.push("记忆初始化策略");
+        if (profile.approvalPolicy || profile.sandbox) deferredFields.push("现有权限配置");
+        const summary = {
+          status: confirmed ? "acknowledged" : "unconfirmed", threadId: id, profileId: profile.id,
+          proofId: confirmed ? proofId : null,
+          nativeModel: methods.getConversation.call(controller, id)?.latestModel || model, deferredFields,
+          message: confirmed ? `热切项已应用：Developer、模型、推理和已指定的 Service Tier。${deferredFields.length ? `未热更新：${deferredFields.join("、")}。` : ""}历史和后台服务保留。`
+            : "请求已返回，但当前版本或本地证明未确认，请核对后再操作",
+        };
+        profileSwitchResults.set(id, summary);
+        return summary;
+      });
+      const settled = () => {
+        if (op.quarantined && op.transportFulfilled && !destroyed && profileSwitches.get(id) === op) {
+          profileSwitches.delete(id);
+          profileSwitchResults.set(id, { status: "unconfirmed", threadId: id, profileId: profile.id,
+            message: "迟到请求已经返回；旧状态仍未确认，可重新核对并应用" });
+          updatePill();
+        }
+      };
+      Promise.resolve(queued).then(settled, settled);
+      const deadline = new Promise((_, reject) => {
+        timer = window.setTimeout(() => {
+          op.cancelled = true;
+          reject(safeError(op.updateInvoked ? "更新结果未知，已禁止重复切换；请等待请求返回或重开应用后核对" : "原生设置队列超时；已取消本次切换"));
+        }, 15000);
+      });
+      return await Promise.race([queued, deadline]);
+    } catch (error) {
+      op.cancelled = true;
+      op.quarantined = op.updateInvoked && !op.transportFulfilled;
+      op.phase = op.quarantined ? "outcome-unknown" : "failed";
+      const message = safeErrors.has(error) ? error.message : op.quarantined
+        ? "更新结果未知，已禁止重复切换；重开应用后请先核对" : "切换失败，未确认更新";
+      if (!destroyed) profileSwitchResults.set(id, { status: "unconfirmed", threadId: id, profileId: profile.id, message });
+      throw new Error(message);
+    } finally {
+      window.clearTimeout(timer);
+      try { op.listenerDispose?.(); } catch {}
+      if (profileSwitches.get(id) === op && !op.quarantined) profileSwitches.delete(id);
+      while (profileSwitchResults.size > MAX_THREAD_ENTRIES) profileSwitchResults.delete(profileSwitchResults.keys().next().value);
+      if (!destroyed) updatePill();
+    }
   }
 
   function publicStatus() {
@@ -2274,9 +2907,11 @@
     return {
       name: "环境注入器",
       version: VERSION,
+      runtimeBuild: "0.4.0",
       generatedAt: ENVIRONMENT_BUNDLE.generatedAt || "",
       profiles: profiles.map(({ id, name, model, modelProvider, source }) => ({ id, name, model, modelProvider, source })),
       currentThreadId: currentId,
+      currentSwitch: currentSwitchStatus(currentId),
       currentProfileId: currentProfile,
       currentProfileBinding: currentEntry ? {
         profileId: currentEntry.profileId,
@@ -2286,6 +2921,9 @@
         at: currentEntry.at || null,
       } : null,
       currentProof: currentProof ? {
+        profileId: currentProof.profileId,
+        profileRevision: currentProof.profileRevision,
+        matchesCurrentProfile: proofMatchesProfile(currentProof, currentProfile),
         proofId: currentProof.proofId,
         status: currentProof.status,
         transport: currentProof.transport,
@@ -2316,6 +2954,7 @@
 
   function refreshEnvironmentData() {
     environmentStore = loadEnvironmentStore();
+    lastCommittedStore = cloneJson(environmentStore);
     refreshProfileCatalog();
     state = loadState();
     renderProfileOptions();
@@ -2408,17 +3047,22 @@
       await refreshBridgeState();
       return uiSnapshot();
     },
-    replaceEnvironmentStore: (nextStore) => {
-      environmentStore = normalizeEnvironmentStore(cloneJson(nextStore));
-      saveEnvironmentStore();
-      refreshProfileCatalog();
-      state = loadState();
-      renderProfileOptions();
-      updatePill();
-      return uiSnapshot();
-    },
+    replaceEnvironmentStore: installEnvironmentStore,
     updateUiPreferences: (patch) => {
-      if (isObject(patch)) Object.assign(environmentStore.ui, cloneJson(patch));
+      if (isObject(patch)) {
+        const nextUi = { ...environmentStore.ui };
+        for (const [key, value] of Object.entries(patch)) {
+          if (!["agentsDraft", "memoryCorrectionDraft", "panelExpanded"].includes(key)) throw new Error("未知界面设置");
+          if (value === undefined) delete nextUi[key];
+          else {
+            if (key === "panelExpanded") {
+              if (typeof value !== "boolean") throw new Error("面板设置必须为布尔值");
+            } else assertSafeDraft(value);
+            nextUi[key] = cloneJson(value, value);
+          }
+        }
+        environmentStore.ui = nextUi;
+      }
       saveEnvironmentStore();
       notifyUiAdapter();
       return uiSnapshot();
@@ -2428,6 +3072,11 @@
       saveState();
       return uiSnapshot();
     },
+    switchThreadProfile,
+    threadSwitchStatus: threadId => currentSwitchStatus(normalizedThreadId(threadId)),
+    saveProfile: saveEnvironmentProfile,
+    validateProfileData: assertSafeProfile,
+    validateDraftData: assertSafeDraft,
     open: () => chooseProfile("下个新对话环境"),
     viewCurrent: openCurrentProfileView,
     viewMemory: openMemoryView,
@@ -2438,6 +3087,9 @@
       return publicStatus();
     },
     clearNext: () => {
+      selectionEpoch += 1;
+      eligiblePrewarms.clear();
+      discardPrewarmedThreads();
       state.pendingProfileId = "";
       saveState();
       return publicStatus();

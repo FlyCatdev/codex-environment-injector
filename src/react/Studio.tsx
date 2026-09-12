@@ -59,7 +59,7 @@ function profileToForm(profile: EnvironmentProfile): StudioForm {
 }
 
 function likelySecret(text: string) {
-  return /\bsk-[A-Za-z0-9_-]{16,}\b|\b(?:api[_-]?key|token|password|secret|authorization|bearer|credential)\s*[:=]/i.test(text)
+  return /\bsk-[A-Za-z0-9_-]{16,}\b|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|authorization|bearer|credential)["']?\s*[:=]|\bBearer\s+[A-Za-z0-9_./+=-]{12,}|[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@/i.test(text)
 }
 
 function tomlString(value: unknown) {
@@ -155,9 +155,18 @@ export function StudioDialog({ api, store, core }: { api: CoreApi; store: ReactU
   const validate = () => {
     if (!/^[A-Za-z0-9_-]+$/.test(form.id)) return '环境 ID 只能包含英文、数字、下划线和减号'
     if (form.developerInstructions.length > 40_000 || form.baseInstructions.length > 40_000) return '提示词不能超过 40000 个字符'
-    try { JSON.parse(form.configText || '{}') } catch { return 'Additional Config JSON 格式无效' }
+    try {
+      const config = JSON.parse(form.configText || '{}')
+      if (!config || typeof config !== 'object' || Array.isArray(config)) return 'Additional Config 必须是 JSON 对象'
+    } catch { return 'Additional Config JSON 格式无效' }
     if (![form.model, form.modelProvider, form.developerInstructions, form.baseInstructions, form.approvalPolicy, form.sandbox, form.serviceTier, form.reasoning].some(Boolean)
       && form.memoryUse === 'inherit' && form.memoryGenerate === 'inherit' && form.configText.trim() === '{}') return '请至少提供一项环境设置'
+    const key = form.targetProfileId ? `override:${form.targetProfileId}` : form.id
+    if (Object.hasOwn(core.environmentStore.profiles, key) && key !== selectedStorageKey) return '环境 ID 已存在，不能覆盖另一环境'
+    const countAfter = Object.keys(core.environmentStore.profiles).length
+      + (Object.hasOwn(core.environmentStore.profiles, key) ? 0 : 1)
+      - (selectedStorageKey && selectedStorageKey !== key && Object.hasOwn(core.environmentStore.profiles, selectedStorageKey) ? 1 : 0)
+    if (countAfter > 50) return '最多保存 50 个本地环境'
     return ''
   }
 
@@ -167,8 +176,9 @@ export function StudioDialog({ api, store, core }: { api: CoreApi; store: ReactU
     let config: Record<string, unknown>
     try { config = JSON.parse(form.configText || '{}') } catch { return }
     if (form.reasoning) config.model_reasoning_effort = form.reasoning
-    if ((likelySecret(form.developerInstructions) || likelySecret(form.baseInstructions) || likelySecret(form.configText))
-      && !window.confirm('环境内容可能包含密钥或认证字段，仍要保存到页面 localStorage 吗？')) return
+    if (likelySecret(form.developerInstructions) || likelySecret(form.baseInstructions) || likelySecret(form.configText)) {
+      setKind('error'); setMessage('敏感字段不允许写入环境；请改用环境变量名或凭据存储'); return
+    }
     const next = clone(core.environmentStore) as EnvironmentStoreV2
     const storageKey = form.targetProfileId ? `override:${form.targetProfileId}` : form.id
     if (selectedStorageKey && selectedStorageKey !== storageKey) delete next.profiles[selectedStorageKey]
@@ -190,11 +200,19 @@ export function StudioDialog({ api, store, core }: { api: CoreApi; store: ReactU
       createdAt: (previous as any)?.createdAt || Date.now(),
       updatedAt: Date.now(),
     } as any
-    api.replaceEnvironmentStore(next)
+    try {
+      api.saveProfile(next.profiles[storageKey], { previousKey: selectedStorageKey, expectedRevision: core.environmentStore.revision })
+    } catch {
+      setKind('error'); setMessage('保存失败：数据无效、环境已变化或存储不可写。请重新加载检查。'); return
+    }
     const environmentId = form.targetProfileId || `studio:${form.id}`
-    if (useNext) api.setNext(environmentId)
     setSelectedId(environmentId)
     setSelectedStorageKey(storageKey)
+    if (useNext) {
+      try { api.setNext(environmentId) } catch {
+        setKind('error'); setMessage('环境已保存，但下次环境选择保存失败'); return
+      }
+    }
     setKind('success')
     setMessage(form.targetProfileId ? `已保存 ${form.targetProfileId} 的本地覆盖。` : `已保存环境 ${form.name || form.id}。`)
   }
@@ -205,15 +223,24 @@ export function StudioDialog({ api, store, core }: { api: CoreApi; store: ReactU
     if (!window.confirm(isOverride ? `恢复文件环境“${form.targetProfileId}”并删除本地覆盖？` : `删除环境“${form.name || form.id}”？`)) return
     const next = clone(core.environmentStore) as EnvironmentStoreV2
     delete next.profiles[selectedStorageKey]
-    api.replaceEnvironmentStore(next)
+    try { api.replaceEnvironmentStore(next) } catch {
+      setKind('error'); setMessage('删除未保存：环境已变化或存储不可写'); return
+    }
     createNew()
     setKind('success')
     setMessage(isOverride ? `已恢复文件环境 ${form.targetProfileId}。` : '环境已删除。')
   }
 
   const exportToml = () => {
+    const invalid = validate()
+    if (invalid || likelySecret(form.developerInstructions) || likelySecret(form.baseInstructions) || likelySecret(form.configText)) {
+      setKind('error'); setMessage(invalid || '敏感内容不允许导出'); return
+    }
     let config: Record<string, unknown> = {}
     try { config = JSON.parse(form.configText || '{}') } catch {}
+    try { api.validateProfileData({ ...form, config }) } catch {
+      setKind('error'); setMessage('配置无效或包含敏感字段，已拒绝导出'); return
+    }
     const blob = new Blob([profileToml(form, config)], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')

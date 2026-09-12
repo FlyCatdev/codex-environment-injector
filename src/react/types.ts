@@ -40,14 +40,38 @@ export interface InjectionProof {
   acknowledgedAt?: string
   dispatchedAt?: string
   method?: string
+  profileRevision?: number
+  matchesCurrentProfile?: boolean
+}
+
+export interface ProfileSwitchResult {
+  status: 'acknowledged' | 'unconfirmed' | 'failed'
+  threadId: string
+  profileId: string
+  message: string
+  proofId?: string | null
+  nativeModel?: string
+  deferredFields?: string[]
+}
+
+export interface ProfileSwitchStatus {
+  busy: boolean
+  available?: boolean
+  blocked?: boolean
+  reason?: string
+  phase?: string
+  profileId?: string
+  result?: ProfileSwitchResult | null
 }
 
 export interface InjectorStatus {
   name: string
   version: string
+  runtimeBuild?: string
   generatedAt?: string
   profiles: Array<Pick<EnvironmentProfile, 'id' | 'name' | 'model' | 'modelProvider' | 'source'>>
   currentThreadId?: string
+  currentSwitch?: ProfileSwitchStatus
   currentProfileId?: string
   currentProfileBinding?: ThreadBinding | null
   currentProof?: InjectionProof | null
@@ -122,6 +146,11 @@ export interface CoreApi {
   setPromptOnNewThread(enabled: boolean): UiSnapshot
   replaceEnvironmentStore(store: EnvironmentStoreV2): UiSnapshot
   updateUiPreferences(patch: Record<string, unknown>): UiSnapshot
+  saveProfile(profile: EnvironmentProfile, options?: { previousKey?: string; expectedRevision?: number }): UiSnapshot
+  validateProfileData(profile: unknown): boolean
+  validateDraftData(text: string): boolean
+  switchThreadProfile(threadId: string, profileId: string): Promise<ProfileSwitchResult>
+  threadSwitchStatus(threadId: string): ProfileSwitchStatus
   open(): Promise<string | null>
   viewCurrent(): Promise<string | null>
   viewMemory(): Promise<string | null>

@@ -4,7 +4,7 @@ import { InjectorApp } from './App'
 import { ReactUiStore } from './store'
 import { REACT_UI_STYLES } from './styles'
 
-const REACT_UI_VERSION = '0.3.2'
+const REACT_UI_VERSION = '0.4.0'
 const HOST_ID = 'codexpp-environment-react-host'
 
 window.__codexEnvironmentReactUi?.destroy?.()

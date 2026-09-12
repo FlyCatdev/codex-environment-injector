@@ -165,7 +165,7 @@ async function testSelector() {
   assert.equal(bridgeState.bridgeAgents.hash, "sha256:agents");
   assert.equal(bridgeState.bridgeMemory.summary.content, "Summary");
   const adapterSnapshot = api.uiSnapshot();
-  assert.equal(adapterSnapshot.status.version, "0.3.2");
+  assert.equal(adapterSnapshot.status.version, "0.4.0");
   assert.ok(Array.isArray(adapterSnapshot.profiles));
   let adapterUpdates = 0;
   let adapterMode = "";
@@ -350,8 +350,10 @@ async function testSelector() {
   assert.equal(forwardedBody.params.config.model_reasoning_effort, "high");
   handlers.get("thread/started")?.({ thread: { id: "thread-test" } });
   const selectorState = JSON.parse(localStorage.getItem("codexpp.environmentInjector.v2"));
-  assert.equal(selectorState.selection.pendingProfileId, "");
-  assert.equal(selectorState.bindingsByThread["thread-test"].profileId, "studio:agents");
+  // An uncorrelated broadcast is not acknowledgment of our request.
+  assert.equal(selectorState.selection.pendingProfileId, "studio:agents");
+  assert.equal(selectorState.bindingsByThread["thread-test"], undefined);
+  assert.equal(selectorState.proofByThread["thread-test"], undefined);
   const wrappedDescriptor = Object.getOwnPropertyDescriptor(dispatcher, "dispatchMessage");
   assert.equal(wrappedDescriptor.enumerable, originalDispatchDescriptor.enumerable);
   assert.equal(wrappedDescriptor.configurable, originalDispatchDescriptor.configurable);

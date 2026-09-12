@@ -5,6 +5,28 @@ description: "Manage, inject, inspect, migrate, and troubleshoot Codex conversat
 
 # 环境注入器
 
+## v0.4.0 existing-conversation switching
+
+The “当前对话” page can apply a Profile to an already loaded, idle local
+conversation owned by this window. It supports Developer instructions, model,
+reasoning effort and explicitly specified Service Tier through native settings.
+Do not claim that a `thread/resume` acknowledgment proves prompt replacement.
+
+The hot-switch operation runs its validation inside the native settings queue,
+correlates the actual `thread/settings/update` request, persists unconfirmed
+state before sending, and quarantines uncertain writes instead of blindly
+retrying. It never unsubscribes the thread or terminates background terminals.
+Different providers, custom Base Instructions, Plan/voice mode and unrelated
+custom collaboration instructions are not overwritten. Additional config,
+memory initialization and permissions are not advertised as hot-applied.
+
+Base retires the active profile-specific role/format rules from this feature.
+It does not erase history or reset provider, base instructions or permissions.
+Changing native workflow settings later can invalidate the active proof.
+
+Public distribution must use `npm run build:public`; never publish a script
+generated from a real user's Codex home by the local installer.
+
 Use the Environment Injector as the preferred Codex++ environment control surface.
 
 ## Scope
